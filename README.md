@@ -1,6 +1,6 @@
-# TestSuggester
+# Conjure Shield
 
-AI-powered Rails test suggestion and implementation generator.
+Auto Rails test suggestion and implementation generator.
 
 ## Installation
 
