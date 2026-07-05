@@ -1,4 +1,4 @@
-# Conjure Shield
+# 🛡️ Conjure Shield 🛡️
 
 Auto Rails test suggestion and implementation generator.
 
