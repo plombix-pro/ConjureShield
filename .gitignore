@@ -1,0 +1,31 @@
+# Gem artifacts
+*.gem
+
+# Bundler
+.bundle/
+vendor/bundle/
+Gemfile.lock
+
+# Test coverage
+coverage/
+coverage/.resultset.json
+coverage/.resultset.json.lock
+
+# RuboCop cache
+.rubocop_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Ruby
+*.rb~
+*.log
+log/
+tmp/
