@@ -23,7 +23,7 @@ module Conjureshield
       destroy: [:delete_destroy, :delete_destroy_redirect]
     }.freeze
 
-    attr_reader :codebase_path, :files, :ast_nodes, :missing_tests, :existing_tests, :routes, :routes_parsed
+    attr_reader :codebase_path, :files, :ast_nodes, :missing_tests, :existing_tests, :routes, :routes_parsed, :devise_model
 
     def initialize(path)
       @codebase_path = File.expand_path(path)
@@ -33,6 +33,7 @@ module Conjureshield
       @files = []
       @routes = {}
       @routes_parsed = false
+      @devise_model = nil
     end
 
     def analyze
@@ -55,6 +56,13 @@ module Conjureshield
         content = File.read(file)
         @files << { path: file, content: content }
         parse_file(file, content)
+      end
+
+      Dir.glob("#{codebase_path}/**/*_controller.js").each do |file|
+        next if file.include?("/node_modules/") || file.include?("/vendor/")
+
+        content = File.read(file)
+        extract_stimulus(file, content)
       end
     end
 
@@ -120,7 +128,13 @@ module Conjureshield
     def extract_model_info(file, ast)
       return unless file.include?("/app/models/")
       
+      content = @files.find { |f| f[:path] == file }&.dig(:content) || ""
       model_name = File.basename(file, ".rb").split('_').map(&:capitalize).join
+      
+      if content.include?("devise ") || content.include?("devise ")
+        @devise_model ||= model_name
+      end
+      
       @ast_nodes << { file: file, model: model_name, type: :model }
     end
 
@@ -263,7 +277,10 @@ module Conjureshield
         end
 
         def visit_def_node(node)
-          @methods << node.name unless @ignored.include?(node.name)
+          unless @ignored.include?(node.name)
+            is_class_method = node.receiver.is_a?(Prism::SelfNode)
+            @methods << { name: node.name, class_method: is_class_method }
+          end
           super
         end
       end.new
@@ -307,9 +324,13 @@ module Conjureshield
     end
 
     def extract_stimulus(file, content)
-      return unless file.include?("application.js") || file.include?("stimulus")
+      return unless file.include?("application.js") || file.include?("stimulus") ||
+                    file.end_with?("_controller.js")
 
-      @ast_nodes << { file: file, type: :stimulus }
+      controller_name = file.match(/(\w+)_controller\.js\z/)&.[](1)
+      identifier = controller_name || File.basename(file, File.extname(file))
+
+      @ast_nodes << { file: file, controller: identifier, type: :stimulus }
     end
 
     def extract_cable_subscriptions(file, content)
@@ -317,6 +338,16 @@ module Conjureshield
       content.scan(/subscribe\s*\(\s*["'](?<sub>[^"]+)["']\s*,\s*["'](?<channel>[^"]+)["']/).each do |match|
         subscriptions << { subscription: match[:sub], channel: match[:channel] }
       end
+      content.scan(/stream_from\s+(?::)?["']?(\w[\w\/]*)["'#]/).each do |match|
+        subscriptions << { subscription: "stream_from", channel: match[0] }
+      end
+
+      match = file.match(%r{/channels/(\w+)_channel\.rb\z})
+      channel_name = "#{match[1].camelize}Channel" if match
+      if channel_name && subscriptions.any?
+        subscriptions.each { |s| s[:channel] = channel_name }
+      end
+
       return if subscriptions.empty?
 
       @ast_nodes << { file: file, subscriptions: subscriptions, type: :cable_subscription }
@@ -324,9 +355,17 @@ module Conjureshield
 
     def extract_cable_broadcasts(file, content)
       channels = []
-      content.scan(/broadcast_to\s*\(\s*["'](?<channel>[^"]+)["']/).each do |match|
+      content.scan(/broadcast_to\s*\(\s*["'](?<channel>[^"']+)["']/).each do |match|
         channels << match[:channel]
       end
+      content.scan(/ActionCable\.server\.broadcast\s*\(\s*["']?(\w[\w\/]*)["'#]/).each do |match|
+        channels << match[0]
+      end
+
+      match = file.match(%r{/channels/(\w+)_channel\.rb\z})
+      channel_name = "#{match[1].camelize}Channel" if match
+      channels.map! { |_| channel_name } if channel_name && channels.any?
+
       return if channels.empty?
 
       @ast_nodes << { file: file, channels: channels, type: :cable_broadcast }
@@ -378,11 +417,13 @@ module Conjureshield
 
         prefix = prefix_stack.any? ? prefix_stack.join("::") + "::" : ""
 
-        if stripped =~ /\bresources\s+(?::|["'])(\w+)/
+        if stripped =~ /\bresources\s+(?::|["'])(\w+)\b/
           resource_name = $1
           controller = "#{prefix}#{resource_name.camelize}Controller"
-          actions = parse_route_options($', RESTFUL_ACTIONS)
-          register_controller_routes(controller, actions)
+          rest = $'
+          actions = parse_route_options(rest, RESTFUL_ACTIONS)
+          param = rest.match(/param:\s*(?::|["'])(\w+)["']?\s*/) && $1
+          register_controller_routes(controller, actions, param: param)
           next
         end
 
@@ -418,16 +459,51 @@ module Conjureshield
       end
     end
 
-    def register_controller_routes(controller, actions)
-      @routes[controller] = (@routes[controller] || []) + actions
-      @routes[controller].uniq!
+    def register_controller_routes(controller, actions, param: nil)
+      @routes[controller] ||= { actions: [], param: nil }
+      @routes[controller][:actions] = (@routes[controller][:actions] + actions).uniq
+      @routes[controller][:param] = param if param
     end
 
     def routable_actions_for(controller_name)
-      @routes.fetch(controller_name, [])
+      @routes.fetch(controller_name, {}).fetch(:actions, [])
+    end
+
+    def route_param_for(controller_name)
+      @routes.dig(controller_name, :param)
+    end
+
+    def parse_schema
+      schema_file = File.join(@codebase_path, "db", "schema.rb")
+      return {} unless File.exist?(schema_file)
+
+      content = File.read(schema_file)
+      tables = {}
+      current_table = nil
+      current_columns = {}
+
+      content.each_line do |line|
+        if line =~ /create_table\s+"(\w+)".*\bdo\b/
+          current_table = $1
+          current_columns = {}
+        elsif current_table && line =~ /t\.(\w+)\s+"(\w+)"/
+          current_columns[$2] = { type: $1.to_sym }
+        elsif current_table && line =~ /^\s*end\s*$/
+          tables[current_table] = current_columns
+          current_table = nil
+          current_columns = {}
+        end
+      end
+
+      tables
+    end
+
+    def table_name_for_model(model_name)
+      model_name.underscore.pluralize
     end
 
     def detect_missing_tests
+      schema_tables = parse_schema
       models = @ast_nodes.select { |n| n[:type] == :model }
       controllers = @ast_nodes.select { |n| n[:type] == :controller }
 
@@ -439,12 +515,15 @@ module Conjureshield
         unless has_test
           suggestions = []
           model_name = model_node[:model]
+          table_name = table_name_for_model(model_name)
+          model_columns = schema_tables.fetch(table_name, {})
 
           if model_node.dig(:metadata, :validations)&.any?
             suggestions << {
               name: "Test active validations",
               type: :validations,
               model: model_name,
+              columns: model_columns,
               fields: model_node[:metadata][:validations],
               validations: model_node[:metadata][:validations]
             }
@@ -457,6 +536,7 @@ module Conjureshield
                 name: "Test #{assoc_type} associations",
                 type: assoc_type,
                 model: model_name,
+                columns: model_columns,
                 associations: model_node[:metadata][:associations]
               }
             end
@@ -467,6 +547,7 @@ module Conjureshield
               name: "Test model scopes",
               type: :scopes,
               model: model_name,
+              columns: model_columns,
               scopes: model_node[:metadata][:scopes]
             }
           end
@@ -477,6 +558,7 @@ module Conjureshield
               name: "Test #{callback_name} callback",
               type: callback_name,
               model: model_name,
+              columns: model_columns,
               callbacks: cb.map { |c| { type: c } }
             }
           end
@@ -486,6 +568,7 @@ module Conjureshield
               name: "Test custom methods",
               type: :custom_methods,
               model: model_name,
+              columns: model_columns,
               custom_methods: model_node[:metadata][:custom_methods]
             }
           end
@@ -494,14 +577,16 @@ module Conjureshield
             suggestions << {
               name: "Test delegation",
               type: :delegation,
-              model: model_name
+              model: model_name,
+              columns: model_columns
             }
           end
 
           suggestions << {
             name: "Test factory",
             type: :factories,
-            model: model_name
+            model: model_name,
+            columns: model_columns
           }
 
           @missing_tests << {
@@ -525,15 +610,21 @@ module Conjureshield
           next if @routes_parsed && routable.empty?
 
           inferred_model = controller_name.sub(/Controller$/, "").singularize
+          inferred_table = table_name_for_model(inferred_model)
+          inferred_columns = schema_tables.fetch(inferred_table, {})
 
           suggestions = []
+
+          route_param = route_param_for(controller_name)
 
           if !@routes_parsed || routable.include?(:index)
             suggestions << {
               name: "Test standard GET #index response parameters",
               type: :get_index,
               controller: controller_name,
-              model: inferred_model
+              model: inferred_model,
+              columns: inferred_columns,
+              route_param: route_param
             }
           end
 
@@ -542,7 +633,9 @@ module Conjureshield
               name: "Test POST #create branch handling",
               type: :post_create,
               controller: controller_name,
-              model: inferred_model
+              model: inferred_model,
+              columns: inferred_columns,
+              route_param: route_param
             }
           end
 
@@ -551,7 +644,9 @@ module Conjureshield
               name: "Test GET #show",
               type: :get_show,
               controller: controller_name,
-              model: inferred_model
+              model: inferred_model,
+              columns: inferred_columns,
+              route_param: route_param
             }
           end
 
@@ -562,6 +657,52 @@ module Conjureshield
             suggestions: suggestions
           }
         end
+      end
+
+      stimulus_nodes = @ast_nodes.select { |n| n[:type] == :stimulus }
+      stimulus_nodes.each do |node|
+        controller_identifier = node[:controller]
+        next unless controller_identifier
+        next if controller_identifier == "application" || controller_identifier == "index"
+
+        expected_spec = "#{controller_identifier}_stimulus_spec.rb"
+        next if @existing_tests.any? { |t| t[:filename] == expected_spec }
+
+        @missing_tests << {
+          type: :stimulus,
+          controller: controller_identifier,
+          file: node[:file],
+          suggestions: [{
+            name: "Test #{controller_identifier} Stimulus controller",
+            type: :stimulus,
+            controller: controller_identifier
+          }]
+        }
+      end
+
+      cable_nodes = @ast_nodes.select { |n| n[:type] == :cable_subscription || n[:type] == :cable_broadcast }
+      channels = []
+      cable_nodes.each do |node|
+        if node[:type] == :cable_subscription
+          node[:subscriptions]&.each { |s| channels << s[:channel] }
+        elsif node[:type] == :cable_broadcast
+          (node[:channels] || []).each { |ch| channels << ch }
+        end
+      end
+      channels.uniq.each do |channel_name|
+        expected_spec = "#{channel_name.underscore}_cable_spec.rb"
+        next if @existing_tests.any? { |t| t[:filename] == expected_spec }
+
+        @missing_tests << {
+          type: :cable,
+          channel: channel_name,
+          file: nil,
+          suggestions: [{
+            name: "Test #{channel_name} channel",
+            type: :cable,
+            channel: channel_name
+          }]
+        }
       end
     end
   end

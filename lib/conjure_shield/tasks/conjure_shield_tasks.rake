@@ -78,6 +78,14 @@ namespace :conjureshield do
     codebase = ENV.fetch("CODEBASE_PATH") { Dir.pwd }
     codebase = File.expand_path(codebase)
 
+    rails_helper = File.join(codebase, "spec", "rails_helper.rb")
+    spec_helper = File.join(codebase, "spec", "spec_helper.rb")
+    unless File.exist?(rails_helper) || File.exist?(spec_helper)
+      puts "\n⚠️  spec/rails_helper.rb or spec/spec_helper.rb not found."
+      puts "   Running rails generate conjure_shield:install first..."
+      Rails::Generators.invoke("conjure_shield:install", [], destination_root: codebase)
+    end
+
     puts "\n🎯 Generating test implementations..."
     puts "=" * 50
 
@@ -87,6 +95,10 @@ namespace :conjureshield do
       puts "📝 Generating #{analyzer.missing_tests.count} test file(s)..."
       Conjureshield.generate_tests(analyzer.files, analyzer.missing_tests)
       puts "\n✅ Tests generated! Check spec/ directory."
+      puts ""
+      puts "⚠️  WARNING: THESE ARE GENERIC TEMPLATES. YOU MUST HEAVILY ADAPT"
+      puts "⚠️  EACH TEST TO MATCH YOUR ACTUAL APPLICATION CODE AND LOGIC."
+      puts ""
     else
       puts "⚠️  No missing tests detected. All features appear to be covered."
     end
@@ -114,10 +126,16 @@ namespace :conjureshield do
     puts "\n📊 Coverage Analysis:"
     puts "-" * 50
     models = analyzer.ast_nodes.select { |n| n[:type] == :model }
+    model_prefixes = models.map { |m| "#{m[:model].underscore}_" }
+
     models.each do |model|
-      model_name = model[:model]
-      model_tests = Dir.glob(File.join(codebase, "spec/models/#{model_name.downcase}*.rb")).count
-      puts "  #{model_name}: #{model_tests} test file(s) found"
+      model_prefix = "#{model[:model].underscore}_"
+      longer_prefixes = model_prefixes.select { |p| p != model_prefix && p.start_with?(model_prefix) }
+
+      all = Dir.glob(File.join(codebase, "spec", "#{model_prefix}*_spec.rb"))
+      all.reject! { |f| longer_prefixes.any? { |lp| File.basename(f).start_with?(lp) } }
+
+      puts "  #{model[:model]}: #{all.count} test file(s) found"
     end
   end
 

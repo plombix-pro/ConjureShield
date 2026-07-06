@@ -64,13 +64,97 @@ module Conjureshield
         'require "rails_helper"'
       elsif File.exist?(File.join(base, "spec", "spec_helper.rb"))
         'require "spec_helper"'
+      elsif rspec?
+        'require "rails_helper"'
       else
-        ""
+        'require "test_helper"'
       end
     end
 
+    def devise?
+      return @_devise if defined?(@_devise)
+      base = @codebase_path || Dir.pwd
+      gemfile = File.join(base, "Gemfile")
+      @_devise = File.exist?(gemfile) && File.read(gemfile).include?("devise")
+    end
+
+    def devise_model_name
+      return @_devise_model if defined?(@_devise_model)
+      @_devise_model = nil
+      models = @code&.select { |f| f[:path].include?("/app/models/") }
+      return nil unless models
+
+      models.each do |model|
+        if model[:content].include?("devise ") || model[:content].include?("devise\n")
+          @_devise_model = File.basename(model[:path], ".rb").split("_").map(&:capitalize).join
+          break
+        end
+      end
+      @_devise_model || "User"
+    end
+
+    def devise_setup(indent: 2, extra_attrs: {})
+      return "" unless devise?
+
+      model = devise_model_name
+      attrs = {email: "test@example.com", password: "password", password_confirmation: "password"}.merge(extra_attrs)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+      pad = " " * indent
+
+      "#{pad}include Devise::Test::IntegrationHelpers\n" \
+      "#{pad}let(:current_user) { #{model}.create!(#{attrs_str}) }\n" \
+      "#{pad}before { sign_in current_user }\n\n"
+    end
+
+    def factory_attributes(model_name, columns: {}, extra_attrs: {})
+      suffix = Time.now.to_i.to_s(36) + rand(999).to_s
+      excluded = %w[id created_at updated_at encrypted_password reset_password_token reset_password_sent_at remember_created_at]
+      hash = columns.reject { |name, _| excluded.include?(name) }.each_with_object({}) do |(col_name, col_info), h|
+        value = case col_name
+                when "email" then "test#{suffix}@example.com"
+                when /_url$/ then "https://example.com/test"
+                when /_email$/ then "test#{suffix}@example.com"
+                else
+                  case col_info[:type]
+                  when :string then "#{col_name.humanize.downcase}#{suffix}"
+                  when :text then "sample text"
+                  when :integer then 1
+                  when :boolean then false
+                  when :datetime, :date then Time.current
+                  when :decimal, :float then 1.0
+                  end
+                end
+        h[col_name.to_sym] = value if value
+      end
+      if columns.key?("encrypted_password")
+        hash[:email] ||= "test#{suffix}@example.com"
+        hash[:password] = "password"
+        hash[:password_confirmation] = "password"
+      end
+      hash.merge!(extra_attrs.symbolize_keys) if extra_attrs.any?
+      hash
+    end
+
+    def prepend_devise(content, model: nil)
+      setup = devise_setup
+      return content if setup.empty?
+      setup + content
+    end
+
+    def factory_attrs_str(model_name)
+      attrs = factory_attributes(model_name)
+      attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+    end
+
+    def controller_factory_attrs(controller)
+      model_name = controller[:model]
+      columns = controller[:columns] || {}
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+    end
+
     def ctrl_base(name)
-      name.to_s.sub(/Controller$/, "").underscore
+      name.to_s.sub(/Controller$/, "").underscore.singularize
     end
 
     def ctrl_route(name)
@@ -114,7 +198,7 @@ module Conjureshield
       when :get_index
         minitest? ? generate_minitest_request_test(suggestion) : generate_get_index_test(suggestion)
       when :post_create
-        minitest? ? generate_minitest_request_test(suggestion) : generate_integration_test(suggestion)
+        minitest? ? generate_minitest_request_test(suggestion) : generate_post_create_valid_test(suggestion)
       when :get_show
         minitest? ? generate_minitest_request_test(suggestion) : generate_get_show_test(suggestion)
       when :index_pagination
@@ -211,7 +295,7 @@ module Conjureshield
         end
       TEST
 
-      write_test_file("#{controller}_stimulus", test_content)
+      write_test_file(controller, test_content)
     end
 
     def generate_cable_test(suggestion)
@@ -281,7 +365,7 @@ module Conjureshield
         end
       TEST
 
-      write_test_file("#{channel}_cable", test_content)
+      write_test_file(channel, test_content)
     end
 
     def generate_validations_test(model)
@@ -293,7 +377,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "validations" do
             #{generate_validation_contexts(fields, validations)}
           end
@@ -349,7 +433,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "validation error messages" do
             it "returns custom error messages" do
               expect(build(:#{model[:model].downcase}), invalid_data: "value").errors.full_messages
@@ -373,7 +457,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "associations" do
             context "has_one associations" do
               #{associations.map { |assoc| generate_has_one_context(assoc) }.join("\n")}
@@ -402,7 +486,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "associations" do
             context "has_many associations" do
               #{associations.map { |assoc| generate_has_many_context(assoc) }.join("\n")}
@@ -431,7 +515,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "associations" do
             context "belongs_to associations" do
               #{associations.map { |assoc| generate_belongs_to_context(assoc) }.join("\n")}
@@ -460,7 +544,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "associations" do
             context "association validations" do
               it { is_expected.to validate_associated_#{model[:model].downcase.pluralize}_of(:#{model[:model].downcase}) }
@@ -479,15 +563,16 @@ module Conjureshield
     def generate_scopes_test(model)
       scopes = model[:scopes]
       model_name = model[:model]
+      columns = model[:columns] || {}
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "scopes" do
-            #{scopes.map { |scope| generate_scope_test(scope, model_name) }.join("\n")}
+            #{scopes.map { |scope| generate_scope_test(scope, model_name, columns: columns) }.join("\n")}
           end
         end
       TEST
@@ -495,12 +580,25 @@ module Conjureshield
       write_test_file(model_name, test_content)
     end
 
-    def generate_scope_test(scope, model_name)
+    def generate_scope_test(scope, model_name, columns: {})
       name = scope[:name]
       args = scope[:args]
 
+      extra = {}
+      boolean_cols = columns.select { |_, ci| ci[:type] == :boolean }.keys
+      if boolean_cols.include?(name.to_s)
+        extra[name.to_sym] = true
+      elsif name.to_s == "active" && boolean_cols.include?("deleted")
+        extra[:deleted] = false
+      elsif name.to_s == "deleted" && boolean_cols.include?("deleted")
+        extra[:deleted] = true
+      end
+      attrs = factory_attributes(model_name, columns: columns, extra_attrs: extra)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+
       <<-TEST
             it "returns #{name} results" do
+              record = described_class.create!(#{attrs_str})
               expect(described_class.#{name}).to be_present
             end
       TEST
@@ -515,7 +613,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "scopes with arguments" do
             #{scopes.map { |scope| generate_scoped_arguments_context(scope, model_name) }.join("\n")}
           end
@@ -539,16 +637,17 @@ module Conjureshield
     def generate_before_save_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :before_save }
       model_name = model[:model]
+      columns = model[:columns] || {}
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "callbacks" do
             context "before_save callbacks" do
-              #{callbacks.map { |cb| generate_before_save_context(cb, model_name) }.join("\n")}
+              #{callbacks.map { |cb| generate_before_save_context(cb, model_name, columns: columns) }.join("\n")}
             end
           end
         end
@@ -557,11 +656,13 @@ module Conjureshield
       write_test_file(model_name, test_content)
     end
 
-    def generate_before_save_context(callback, model_name)
+    def generate_before_save_context(callback, model_name, columns: {})
       var = model_name.underscore
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
       <<-CONTEXT
               it "executes before_save callback" do
-                #{var} = described_class.new
+                #{var} = described_class.new(#{attrs_str})
                 expect { #{var}.save(validate: false) }.not_to raise_error
               end
       CONTEXT
@@ -570,16 +671,17 @@ module Conjureshield
     def generate_after_save_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :after_save }
       model_name = model[:model]
+      columns = model[:columns] || {}
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "callbacks" do
             context "after_save callbacks" do
-              #{callbacks.map { |cb| generate_after_save_context(cb, model_name) }.join("\n")}
+              #{callbacks.map { |cb| generate_after_save_context(cb, model_name, columns: columns) }.join("\n")}
             end
           end
         end
@@ -588,11 +690,13 @@ module Conjureshield
       write_test_file(model_name, test_content)
     end
 
-    def generate_after_save_context(callback, model_name)
+    def generate_after_save_context(callback, model_name, columns: {})
       var = model_name.underscore
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
       <<-CONTEXT
               it "executes after_save callback" do
-                #{var} = described_class.new
+                #{var} = described_class.new(#{attrs_str})
                 expect { #{var}.save }.not_to raise_error
               end
       CONTEXT
@@ -601,16 +705,17 @@ module Conjureshield
     def generate_before_destroy_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :before_destroy }
       model_name = model[:model]
+      columns = model[:columns] || {}
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "callbacks" do
             context "before_destroy callbacks" do
-              #{callbacks.map { |cb| generate_before_destroy_context(cb, model_name) }.join("\n")}
+              #{callbacks.map { |cb| generate_before_destroy_context(cb, model_name, columns: columns) }.join("\n")}
             end
           end
         end
@@ -619,11 +724,13 @@ module Conjureshield
       write_test_file(model_name, test_content)
     end
 
-    def generate_before_destroy_context(callback, model_name)
+    def generate_before_destroy_context(callback, model_name, columns: {})
       var = model_name.underscore
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
       <<-CONTEXT
               it "executes before_destroy callback" do
-                #{var} = described_class.new
+                #{var} = described_class.new(#{attrs_str})
                 expect { #{var}.destroy }.not_to raise_error
               end
       CONTEXT
@@ -632,16 +739,17 @@ module Conjureshield
     def generate_after_destroy_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :after_destroy }
       model_name = model[:model]
+      columns = model[:columns] || {}
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "callbacks" do
             context "after_destroy callbacks" do
-              #{callbacks.map { |cb| generate_after_destroy_context(cb, model_name) }.join("\n")}
+              #{callbacks.map { |cb| generate_after_destroy_context(cb, model_name, columns: columns) }.join("\n")}
             end
           end
         end
@@ -650,11 +758,13 @@ module Conjureshield
       write_test_file(model_name, test_content)
     end
 
-    def generate_after_destroy_context(callback, model_name)
+    def generate_after_destroy_context(callback, model_name, columns: {})
       var = model_name.underscore
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
       <<-CONTEXT
               it "executes after_destroy callback" do
-                #{var} = described_class.new
+                #{var} = described_class.new(#{attrs_str})
                 expect { #{var}.destroy }.not_to raise_error
               end
       CONTEXT
@@ -663,15 +773,16 @@ module Conjureshield
     def generate_custom_methods_test(model)
       methods = model[:custom_methods]
       model_name = model[:model]
+      columns = model[:columns] || {}
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model_name}", type: :model do
+        RSpec.describe #{model_name}, type: :model do
           describe "custom methods" do
-            #{methods.map { |m| generate_custom_method_test(m, model_name) }.join("\n")}
+            #{methods.map { |m| generate_custom_method_test(m, model_name, columns: columns) }.join("\n")}
           end
         end
       TEST
@@ -679,34 +790,56 @@ module Conjureshield
       write_test_file(model_name, test_content)
     end
 
-    def generate_custom_method_test(method, model_name)
+    def generate_custom_method_test(method, model_name, columns: {})
+      name = method.is_a?(Hash) ? method[:name] : method
+      is_class_method = method.is_a?(Hash) && method[:class_method]
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+
+      receiver = is_class_method ? "described_class" : "described_class.new(#{attrs_str})"
+
+      matcher = case name.to_s
+                when /\?$/ then "be(true).or be(false)"
+                when /^ransackable/ then "be_a(Array)"
+                else "be_present"
+                end
+
       <<-TEST
-            it "returns #{method} result" do
-              expect(described_class.new.#{method}).to be_present
+            it "returns #{name} result" do
+              expect(#{receiver}.#{name}).to #{matcher}
             end
       TEST
     end
 
     def generate_factories_test(model)
+      model_name = model[:model]
+      columns = model[:columns] || {}
+      attrs = factory_attributes(model_name, columns: columns)
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(",\n        ")
+
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}" do
-          it "creates valid #{model[:model].downcase} instances" do
-            record = #{model[:model]}.new
+         RSpec.describe #{model_name} do
+          it "creates valid #{model_name.downcase} instances" do
+            record = #{model_name}.new(
+              #{attrs_str}
+            )
             expect(record).to be_valid
           end
 
-          it "creates #{model[:model].downcase} with default values" do
-            record = #{model[:model]}.new
+          it "creates #{model_name.downcase} with default values" do
+            record = #{model_name}.new(
+              #{attrs_str}
+            )
             expect(record).to be_valid
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
     def generate_serialization_test(model)
@@ -715,7 +848,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "serialization" do
             it "serializes to JSON" do
               expect(build(:#{model[:model].downcase}).to_json).to be_present
@@ -737,7 +870,7 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe #{model[:model]}, type: :model do
           describe "delegation" do
             it "delegates method to association" do
               expect(build(:#{model[:model].downcase})).to delegate(:method_name).to(:association_name)
@@ -754,26 +887,40 @@ module Conjureshield
     end
 
     def generate_get_index_test(controller)
+      devise_block = devise_setup
+      route_plural = ctrl_route(controller[:controller])
+      model_name = controller[:model]
+      columns = controller[:columns] || {}
+
+      attrs1 = factory_attributes(model_name, columns: columns)
+      attrs2 = factory_attributes(model_name, columns: columns)
+      attrs1_str = attrs1.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+      attrs2_str = attrs2.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
+          #{devise_block}
           describe "GET index action" do
+            let!(:record1) { #{model_name}.create!(#{attrs1_str}) }
+            let!(:record2) { #{model_name}.create!(#{attrs2_str}) }
+
             it "returns success response" do
-              get #{ctrl_route(controller[:controller])}_path
+              get #{route_plural}_path
               expect(response).to have_http_status(:ok)
             end
 
             it "renders index template" do
-              get #{ctrl_route(controller[:controller])}_path
+              get #{route_plural}_path
               expect(response).to render_template(:index)
             end
 
             it "passes correct instance variables" do
-              get #{ctrl_route(controller[:controller])}_path
-              expect(assigns(:#{ctrl_route(controller[:controller])})).to be_present
+              get #{route_plural}_path
+              expect(assigns(:#{route_plural})).to be_present
             end
           end
         end
@@ -835,26 +982,37 @@ module Conjureshield
     end
 
     def generate_get_show_test(controller)
+      singular = ctrl_base(controller[:controller])
+      route_param = controller[:route_param]
+      model_name = controller[:model]
+      columns = controller[:columns] || {}
+      attrs_str = factory_attributes(model_name, columns: columns).map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+
+      show_path_arg = route_param ? "record.#{route_param}" : "record"
+
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
+          #{devise_setup}
           describe "GET show action" do
+            let!(:record) { #{model_name}.create!(#{attrs_str}) }
+
             it "returns success response" do
-              get #{ctrl_route(controller[:controller])}_path(1)
+              get #{singular}_path(#{show_path_arg})
               expect(response).to have_http_status(:ok)
             end
 
             it "renders show template" do
-              get #{ctrl_base(controller[:controller]).singularize}_path(1)
+              get #{singular}_path(#{show_path_arg})
               expect(response).to render_template(:show)
             end
 
             it "passes correct instance variables" do
-              get #{ctrl_base(controller[:controller]).singularize}_path(1)
-              expect(assigns(:#{ctrl_base(controller[:controller])})).to be_present
+              get #{singular}_path(#{show_path_arg})
+              expect(assigns(:#{singular})).to be_present
             end
           end
         end
@@ -1435,7 +1593,8 @@ module Conjureshield
 
         #{spec_helper_require}
 
-        RSpec.describe "#{ctrl_base(controller).capitalize}", type: :integration do
+         RSpec.describe "#{ctrl_base(controller).capitalize}", type: :request do
+          #{devise_setup}
           describe "user workflow" do
             context "create and view" do
               it "creates a new #{model} and redirects to show" do
