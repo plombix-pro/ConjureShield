@@ -6,6 +6,8 @@ require "conjure_shield/templates"
 
 module Conjureshield
   class << self
+    attr_accessor :install_shown
+
     def analyze(path)
       Conjureshield::Analyzer.new(path).analyze
     end

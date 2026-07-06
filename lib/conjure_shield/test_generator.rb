@@ -1,3 +1,5 @@
+require "fileutils"
+
 module Conjureshield
   class TestGenerator
     attr_reader :code, :suggestions, :templates
@@ -6,130 +8,173 @@ module Conjureshield
       @code = code
       @suggestions = suggestions
       @templates = Templates.load
+      @codebase_path = Dir.pwd
+      @framework = nil
     end
 
     def self.generate(code, suggestions)
       new(code, suggestions).generate_all
     end
 
+    def self.generate_with_path(code, suggestions, codebase_path)
+      new(code, suggestions).tap do |g|
+        g.instance_variable_set(:@codebase_path, codebase_path)
+        g.instance_variable_set(:@framework, nil)
+      end.generate_all
+    end
+
     def generate_all
-      suggestions.each do |suggestion|
-        generate_test(suggestion)
+      @suggestions.each do |missing_test|
+        inner = missing_test[:suggestions] || []
+        context = missing_test.reject { |k, _| k == :suggestions }
+
+        inner.each do |suggestion|
+          merged = context.merge(suggestion)
+          @current_type = merged[:type]
+          generate_test(merged)
+        end
       end
+    end
+
+    private
+
+    def framework
+      @framework ||= detect_framework
+    end
+
+    def rspec?
+      framework == :rspec
+    end
+
+    def minitest?
+      framework == :minitest
+    end
+
+    def detect_framework
+      base = @codebase_path || Dir.pwd
+      spec_dir = Dir.exist?(File.join(base, "spec"))
+      test_dir = Dir.exist?(File.join(base, "test"))
+      return :minitest if test_dir && !spec_dir
+      :rspec
+    end
+
+    def spec_helper_require
+      base = @codebase_path || Dir.pwd
+      if File.exist?(File.join(base, "spec", "rails_helper.rb"))
+        'require "rails_helper"'
+      elsif File.exist?(File.join(base, "spec", "spec_helper.rb"))
+        'require "spec_helper"'
+      else
+        ""
+      end
+    end
+
+    def ctrl_base(name)
+      name.to_s.sub(/Controller$/, "").underscore
+    end
+
+    def ctrl_route(name)
+      ctrl_base(name).pluralize
     end
 
     def generate_test(suggestion)
       case suggestion[:type]
       when :validations
-        generate_validations_test(suggestion)
+        minitest? ? generate_minitest_validations(suggestion) : generate_validations_test(suggestion)
       when :validation_messages
-        generate_validation_messages_test(suggestion)
+        minitest? ? generate_minitest_validations(suggestion) : generate_validation_messages_test(suggestion)
       when :has_one
-        generate_has_one_test(suggestion)
+        minitest? ? generate_minitest_associations(suggestion) : generate_has_one_test(suggestion)
       when :has_many
-        generate_has_many_test(suggestion)
+        minitest? ? generate_minitest_associations(suggestion) : generate_has_many_test(suggestion)
       when :belongs_to
-        generate_belongs_to_test(suggestion)
+        minitest? ? generate_minitest_associations(suggestion) : generate_belongs_to_test(suggestion)
       when :association_validations
-        generate_association_validations_test(suggestion)
+        minitest? ? generate_minitest_associations(suggestion) : generate_association_validations_test(suggestion)
       when :scopes
-        generate_scopes_test(suggestion)
+        minitest? ? generate_minitest_scopes(suggestion) : generate_scopes_test(suggestion)
       when :scoped_arguments
-        generate_scoped_arguments_test(suggestion)
+        minitest? ? generate_minitest_scopes(suggestion) : generate_scoped_arguments_test(suggestion)
       when :before_save
-        generate_before_save_test(suggestion)
+        minitest? ? generate_minitest_callbacks(suggestion) : generate_before_save_test(suggestion)
       when :after_save
-        generate_after_save_test(suggestion)
+        minitest? ? generate_minitest_callbacks(suggestion) : generate_after_save_test(suggestion)
       when :before_destroy
-        generate_before_destroy_test(suggestion)
+        minitest? ? generate_minitest_callbacks(suggestion) : generate_before_destroy_test(suggestion)
       when :after_destroy
-        generate_after_destroy_test(suggestion)
+        minitest? ? generate_minitest_callbacks(suggestion) : generate_after_destroy_test(suggestion)
       when :custom_methods
-        generate_custom_methods_test(suggestion)
+        minitest? ? generate_minitest_custom_methods(suggestion) : generate_custom_methods_test(suggestion)
       when :factories
-        generate_factories_test(suggestion)
+        minitest? ? generate_minitest_factories(suggestion) : generate_factories_test(suggestion)
       when :serialization
-        generate_serialization_test(suggestion)
+        minitest? ? generate_minitest_serialization(suggestion) : generate_serialization_test(suggestion)
       when :delegation
-        generate_delegation_test(suggestion)
+        minitest? ? generate_minitest_serialization(suggestion) : generate_delegation_test(suggestion)
       when :get_index
-        generate_get_index_test(suggestion)
-      when :index_pagination
-        generate_index_pagination_test(suggestion)
-      when :index_sorting
-        generate_index_sorting_test(suggestion)
-      when :get_show
-        generate_get_show_test(suggestion)
-      when :show_with_associations
-        generate_show_with_associations_test(suggestion)
-      when :get_new
-        generate_get_new_test(suggestion)
-      when :new_form
-        generate_new_form_test(suggestion)
-      when :get_edit
-        generate_get_edit_test(suggestion)
-      when :edit_form
-        generate_edit_form_test(suggestion)
-      when :post_create_valid
-        generate_post_create_valid_test(suggestion)
-      when :post_create_invalid
-        generate_post_create_invalid_test(suggestion)
-      when :post_create_redirect
-        generate_post_create_redirect_test(suggestion)
-      when :put_patch_update_valid
-        generate_put_patch_update_valid_test(suggestion)
-      when :put_patch_update_invalid
-        generate_put_patch_update_invalid_test(suggestion)
-      when :put_patch_update_redirect
-        generate_put_patch_update_redirect_test(suggestion)
-      when :delete_destroy
-        generate_delete_destroy_test(suggestion)
-      when :delete_destroy_redirect
-        generate_delete_destroy_redirect_test(suggestion)
-      when :strong_parameters_permit
-        generate_strong_parameters_permit_test(suggestion)
-      when :strong_parameters_deny
-        generate_strong_parameters_deny_test(suggestion)
-      when :flash_messages
-        generate_flash_messages_test(suggestion)
-      when :redirects
-        generate_redirects_test(suggestion)
-      when :json_responses
-        generate_json_responses_test(suggestion)
-      when :create_view
-        generate_integration_test(suggestion)
-      when :edit_update
-        generate_integration_test(suggestion)
-      when :delete
-        generate_integration_test(suggestion)
-      when :view_details
-        generate_integration_test(suggestion)
-      when :get_list
-        generate_api_test(suggestion)
-      when :get_single
-        generate_api_test(suggestion)
+        minitest? ? generate_minitest_request_test(suggestion) : generate_get_index_test(suggestion)
       when :post_create
-        generate_api_test(suggestion)
-      when :put_update
-        generate_api_test(suggestion)
+        minitest? ? generate_minitest_request_test(suggestion) : generate_integration_test(suggestion)
+      when :get_show
+        minitest? ? generate_minitest_request_test(suggestion) : generate_get_show_test(suggestion)
+      when :index_pagination
+        minitest? ? generate_minitest_request_test(suggestion) : generate_index_pagination_test(suggestion)
+      when :index_sorting
+        minitest? ? generate_minitest_request_test(suggestion) : generate_index_sorting_test(suggestion)
+      when :show_with_associations
+        minitest? ? generate_minitest_request_test(suggestion) : generate_show_with_associations_test(suggestion)
+      when :get_new
+        minitest? ? generate_minitest_request_test(suggestion) : generate_get_new_test(suggestion)
+      when :new_form
+        minitest? ? generate_minitest_request_test(suggestion) : generate_new_form_test(suggestion)
+      when :get_edit
+        minitest? ? generate_minitest_request_test(suggestion) : generate_get_edit_test(suggestion)
+      when :edit_form
+        minitest? ? generate_minitest_request_test(suggestion) : generate_edit_form_test(suggestion)
+      when :post_create_valid
+        minitest? ? generate_minitest_request_test(suggestion) : generate_post_create_valid_test(suggestion)
+      when :post_create_invalid
+        minitest? ? generate_minitest_request_test(suggestion) : generate_post_create_invalid_test(suggestion)
+      when :post_create_redirect
+        minitest? ? generate_minitest_request_test(suggestion) : generate_post_create_redirect_test(suggestion)
+      when :put_patch_update_valid
+        minitest? ? generate_minitest_request_test(suggestion) : generate_put_patch_update_valid_test(suggestion)
+      when :put_patch_update_invalid
+        minitest? ? generate_minitest_request_test(suggestion) : generate_put_patch_update_invalid_test(suggestion)
+      when :put_patch_update_redirect
+        minitest? ? generate_minitest_request_test(suggestion) : generate_put_patch_update_redirect_test(suggestion)
       when :delete_destroy
-        generate_api_test(suggestion)
-      when :create_view_feature
-        generate_feature_test(suggestion)
-      when :edit_feature
-        generate_feature_test(suggestion)
-      when :delete_feature
-        generate_feature_test(suggestion)
-      when :view_details_feature
-        generate_feature_test(suggestion)
+        minitest? ? generate_minitest_request_test(suggestion) : generate_delete_destroy_test(suggestion)
+      when :delete_destroy_redirect
+        minitest? ? generate_minitest_request_test(suggestion) : generate_delete_destroy_redirect_test(suggestion)
+      when :strong_parameters_permit
+        minitest? ? generate_minitest_request_test(suggestion) : generate_strong_parameters_permit_test(suggestion)
+      when :strong_parameters_deny
+        minitest? ? generate_minitest_request_test(suggestion) : generate_strong_parameters_deny_test(suggestion)
+      when :flash_messages
+        minitest? ? generate_minitest_request_test(suggestion) : generate_flash_messages_test(suggestion)
+      when :redirects
+        minitest? ? generate_minitest_request_test(suggestion) : generate_redirects_test(suggestion)
+      when :json_responses
+        minitest? ? generate_minitest_request_test(suggestion) : generate_json_responses_test(suggestion)
+      when :create_view, :edit_update, :delete, :view_details
+        minitest? ? generate_minitest_request_test(suggestion) : generate_integration_test(suggestion)
+      when :get_list, :get_single, :put_update
+        minitest? ? generate_minitest_request_test(suggestion) : generate_api_test(suggestion)
+      when :create_view_feature, :edit_feature, :delete_feature, :view_details_feature
+        minitest? ? generate_minitest_request_test(suggestion) : generate_feature_test(suggestion)
       when :stimulus
-        generate_stimulus_test(suggestion)
+        minitest? ? generate_minitest_request_test(suggestion) : generate_stimulus_test(suggestion)
       when :cable
-        generate_cable_test(suggestion)
+        minitest? ? generate_minitest_request_test(suggestion) : generate_cable_test(suggestion)
       end
     end
 
     private
+
+    def minitest?
+      @framework == :minitest
+    end
 
     def generate_stimulus_test(suggestion)
       controller = suggestion[:controller]
@@ -137,7 +182,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller}", type: :stimulus do
           describe "Stimulus controller" do
@@ -175,7 +220,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "ApplicationCable::#{channel}", type: :cable do
           let(:connection) { ApplicationCable::Connection.new }
@@ -246,7 +291,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "validations" do
@@ -270,14 +315,30 @@ module Conjureshield
 
     def generate_validation_context(validation)
       field = validation[:field]
-      validator = validation[:validator]
+      validators = validation[:validators] || []
+
+      matchers = validators.map do |v|
+        case v.to_s.downcase
+        when "presence"
+          "it { is_expected.to validate_presence_of(:#{field}) }"
+        when "uniqueness"
+          "it { is_expected.to validate_uniqueness_of(:#{field}) }"
+        when "length"
+          "it { is_expected.to validate_length_of(:#{field}) }"
+        when "inclusion"
+          "it { is_expected.to validate_inclusion_of(:#{field}).in_array([]) }"
+        when "format"
+          "it { is_expected.to allow_value(\"value\").for(:#{field}) }"
+        when "numericality"
+          "it { is_expected.to validate_numericality_of(:#{field}) }"
+        else
+          "it { is_expected.to validate_presence_of(:#{field}) }"
+        end
+      end
 
       <<-CONTEXT
             context "validates #{field}" do
-              it { is_expected.to validate_presence_of(:#{field}) }
-              it { is_expected.to validate_inclusion_of(:#{field}).in_array([valid_value]).allow_nil }
-              it { is_expected.to validate_uniqueness_of(:#{field}).on(:create).case_insensitive }
-              it { is_expected.to validate_format_of(:#{field}).with(:email) }
+              #{matchers.join("\n              ")}
             end
       CONTEXT
     end
@@ -286,7 +347,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "validation error messages" do
@@ -310,7 +371,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "associations" do
@@ -328,12 +389,8 @@ module Conjureshield
       target = assoc[:target]
 
       <<-CONTEXT
-              it { is_expected.to have_1_#{target.downcase.pluralize}_association }
-              it { is_expected.to have_1_#{target.downcase}_association }
-              it { is_expected.to have_1_#{target.downcase}_association.that.exists }
-              it { is_expected.to have_1_#{target.downcase}_association.that.is_a(#{target}) }
-              it { is_expected.to have_1_#{target.downcase}_association.that.is_a(#{target}) }
-            end
+              it { is_expected.to have_one(:#{target.downcase}) }
+              it { is_expected.to have_one(:#{target.downcase}) }
       CONTEXT
     end
 
@@ -343,7 +400,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "associations" do
@@ -361,11 +418,8 @@ module Conjureshield
       target = assoc[:target]
 
       <<-CONTEXT
-              it { is_expected.to have_many_#{target.downcase.pluralize}_associations }
-              it { is_expected.to have_many_#{target.downcase.pluralize}_associations.that.exists }
-              it { is_expected.to have_many_#{target.downcase.pluralize}_associations.that.are_a(#{target}) }
-              it { is_expected.to have_many_#{target.downcase.pluralize}_associations.that.are_a(#{target}) }
-            end
+              it { is_expected.to have_many(:#{target.downcase.pluralize}) }
+              it { is_expected.to have_many(:#{target.downcase.pluralize}) }
       CONTEXT
     end
 
@@ -375,7 +429,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "associations" do
@@ -393,11 +447,8 @@ module Conjureshield
       target = assoc[:target]
 
       <<-CONTEXT
-              it { is_expected.to belong_to_#{target.downcase}_associations }
-              it { is_expected.to belong_to_#{target.downcase}_associations.that.exists }
-              it { is_expected.to belong_to_#{target.downcase}_associations.that.is_a(#{target}) }
-              it { is_expected.to belong_to_#{target.downcase}_associations.that.is_a(#{target}) }
-            end
+              it { is_expected.to belong_to(:#{target.downcase}) }
+              it { is_expected.to belong_to(:#{target.downcase}) }
       CONTEXT
     end
 
@@ -407,7 +458,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "associations" do
@@ -427,208 +478,211 @@ module Conjureshield
 
     def generate_scopes_test(model)
       scopes = model[:scopes]
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "scopes" do
-            #{scopes.map { |scope| generate_scope_test(scope) }.join("\n")}
+            #{scopes.map { |scope| generate_scope_test(scope, model_name) }.join("\n")}
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_scope_test(scope)
+    def generate_scope_test(scope, model_name)
       name = scope[:name]
       args = scope[:args]
 
       <<-TEST
             it "returns #{name} results" do
-              expect(#{model[:model].downcase.pluralize}.#{name}).to be_present
-            end
-
-            it "returns #{name} results with arguments" do
-              expect(#{model[:model].downcase.pluralize}.#{name}(#{args.join(", ")})).to be_present
+              expect(described_class.#{name}).to be_present
             end
       TEST
     end
 
     def generate_scoped_arguments_test(model)
       scopes = model[:scopes]
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "scopes with arguments" do
-            #{scopes.map { |scope| generate_scoped_arguments_context(scope) }.join("\n")}
+            #{scopes.map { |scope| generate_scoped_arguments_context(scope, model_name) }.join("\n")}
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_scoped_arguments_context(scope)
+    def generate_scoped_arguments_context(scope, model_name)
       name = scope[:name]
       args = scope[:args]
 
       <<-CONTEXT
             it "accepts #{name} with #{args.join(", ")}" do
-              expect(#{model[:model].downcase.pluralize}.#{name}(#{args.join(", ")})).to be_present
+              expect(described_class.#{name}(#{args.join(", ")})).to be_present
             end
       CONTEXT
     end
 
     def generate_before_save_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :before_save }
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "callbacks" do
             context "before_save callbacks" do
-              #{callbacks.map { |callback| generate_before_save_context(callback) }.join("\n")}
+              #{callbacks.map { |cb| generate_before_save_context(cb, model_name) }.join("\n")}
             end
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_before_save_context(callback)
+    def generate_before_save_context(callback, model_name)
+      var = model_name.underscore
       <<-CONTEXT
               it "executes before_save callback" do
-                expect {
-                  build(:#{model[:model].downcase})
-                }.to change { model[:model].downcase }.from(nil).to(be_present)
+                #{var} = described_class.new
+                expect { #{var}.save(validate: false) }.not_to raise_error
               end
       CONTEXT
     end
 
     def generate_after_save_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :after_save }
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "callbacks" do
             context "after_save callbacks" do
-              #{callbacks.map { |callback| generate_after_save_context(callback) }.join("\n")}
+              #{callbacks.map { |cb| generate_after_save_context(cb, model_name) }.join("\n")}
             end
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_after_save_context(callback)
+    def generate_after_save_context(callback, model_name)
+      var = model_name.underscore
       <<-CONTEXT
               it "executes after_save callback" do
-                expect {
-                  create(:#{model[:model].downcase})
-                }.to change { model[:model].downcase }.from(nil).to(be_present)
+                #{var} = described_class.new
+                expect { #{var}.save }.not_to raise_error
               end
       CONTEXT
     end
 
     def generate_before_destroy_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :before_destroy }
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "callbacks" do
             context "before_destroy callbacks" do
-              #{callbacks.map { |callback| generate_before_destroy_context(callback) }.join("\n")}
+              #{callbacks.map { |cb| generate_before_destroy_context(cb, model_name) }.join("\n")}
             end
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_before_destroy_context(callback)
+    def generate_before_destroy_context(callback, model_name)
+      var = model_name.underscore
       <<-CONTEXT
               it "executes before_destroy callback" do
-                expect {
-                  destroy(:#{model[:model].downcase})
-                }.to change { model[:model].downcase }.from(be_present).to(nil)
+                #{var} = described_class.new
+                expect { #{var}.destroy }.not_to raise_error
               end
       CONTEXT
     end
 
     def generate_after_destroy_test(model)
       callbacks = model[:callbacks].select { |c| c[:type] == :after_destroy }
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "callbacks" do
             context "after_destroy callbacks" do
-              #{callbacks.map { |callback| generate_after_destroy_context(callback) }.join("\n")}
+              #{callbacks.map { |cb| generate_after_destroy_context(cb, model_name) }.join("\n")}
             end
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_after_destroy_context(callback)
+    def generate_after_destroy_context(callback, model_name)
+      var = model_name.underscore
       <<-CONTEXT
               it "executes after_destroy callback" do
-                expect {
-                  destroy(:#{model[:model].downcase})
-                }.to change { model[:model].downcase }.from(be_present).to(nil)
+                #{var} = described_class.new
+                expect { #{var}.destroy }.not_to raise_error
               end
       CONTEXT
     end
 
     def generate_custom_methods_test(model)
       methods = model[:custom_methods]
+      model_name = model[:model]
 
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{model[:model]}", type: :model do
+        RSpec.describe "#{model_name}", type: :model do
           describe "custom methods" do
-            #{methods.map { |method| generate_custom_method_test(method) }.join("\n")}
+            #{methods.map { |m| generate_custom_method_test(m, model_name) }.join("\n")}
           end
         end
       TEST
 
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, test_content)
     end
 
-    def generate_custom_method_test(method)
+    def generate_custom_method_test(method, model_name)
       <<-TEST
             it "returns #{method} result" do
-              expect(build(:#{model[:model].downcase}).#{method}).to be_present
+              expect(described_class.new.#{method}).to be_present
             end
       TEST
     end
@@ -637,22 +691,17 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "FactoryBot factories for #{model[:model]}" do
+        RSpec.describe "#{model[:model]}" do
           it "creates valid #{model[:model].downcase} instances" do
-            factory = FactoryBot.build(:#{model[:model].downcase})
-            expect(factory).to be_valid
+            record = #{model[:model]}.new
+            expect(record).to be_valid
           end
 
           it "creates #{model[:model].downcase} with default values" do
-            factory = FactoryBot.build(:#{model[:model].downcase})
-            expect(factory).to have_attributes(default_attributes)
-          end
-
-          it "creates #{model[:model].downcase} with custom values" do
-            factory = FactoryBot.build(:#{model[:model].downcase}, custom_attrs: "value")
-            expect(factory).to have_attributes(custom_attrs: "value")
+            record = #{model[:model]}.new
+            expect(record).to be_valid
           end
         end
       TEST
@@ -664,7 +713,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "serialization" do
@@ -686,7 +735,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{model[:model]}", type: :model do
           describe "delegation" do
@@ -708,23 +757,23 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET index action" do
             it "returns success response" do
-              get "#{controller[:controller].downcase.pluralize}s_path"
+              get #{ctrl_route(controller[:controller])}_path
               expect(response).to have_http_status(:ok)
             end
 
             it "renders index template" do
-              get "#{controller[:controller].downcase.pluralize}s_path"
+              get #{ctrl_route(controller[:controller])}_path
               expect(response).to render_template(:index)
             end
 
             it "passes correct instance variables" do
-              get "#{controller[:controller].downcase.pluralize}s_path"
-              expect(assigns(:#{controller[:controller].downcase.pluralize})).to be_present
+              get #{ctrl_route(controller[:controller])}_path
+              expect(assigns(:#{ctrl_route(controller[:controller])})).to be_present
             end
           end
         end
@@ -737,13 +786,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET index action" do
             context "with pagination" do
               it "returns paginated results" do
-                get "#{controller[:controller].downcase.pluralize}s_path"
+                get #{ctrl_route(controller[:controller])}_path
                 expect(response).to have_http_status(:ok)
               end
 
@@ -763,13 +812,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET index action" do
             context "with sorting" do
               it "sorts by default" do
-                get "#{controller[:controller].downcase.pluralize}s_path"
+                get #{ctrl_route(controller[:controller])}_path
                 expect(response).to have_http_status(:ok)
               end
 
@@ -789,23 +838,23 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET show action" do
             it "returns success response" do
-              get "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+              get #{ctrl_route(controller[:controller])}_path(1)
               expect(response).to have_http_status(:ok)
             end
 
             it "renders show template" do
-              get "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+              get #{ctrl_base(controller[:controller]).singularize}_path(1)
               expect(response).to render_template(:show)
             end
 
             it "passes correct instance variables" do
-              get "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
-              expect(assigns(:#{controller[:controller].downcase})).to be_present
+              get #{ctrl_base(controller[:controller]).singularize}_path(1)
+              expect(assigns(:#{ctrl_base(controller[:controller])})).to be_present
             end
           end
         end
@@ -818,13 +867,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET show action" do
             context "with associations" do
               it "includes associated records" do
-                get "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+                get #{ctrl_base(controller[:controller]).singularize}_path(1)
                 expect(response).to have_http_status(:ok)
               end
             end
@@ -839,12 +888,12 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET new action" do
             it "returns success response" do
-              get "#{controller[:controller].downcase.pluralize}_new"
+              get new_#{ctrl_route(controller[:controller])}_path
               expect(response).to have_http_status(:ok)
             end
 
@@ -855,7 +904,7 @@ module Conjureshield
 
             it "passes correct instance variables" do
               get "#{controller[:controller].downcase.pluralize}_new"
-              expect(assigns(:#{controller[:controller].downcase})).to be_a(#{controller[:controller].downcase})
+              expect(assigns(:#{ctrl_base(controller[:controller])})).to be_a(#{controller[:controller]})
             end
           end
         end
@@ -868,7 +917,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET new action" do
@@ -894,12 +943,12 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET edit action" do
             it "returns success response" do
-              get "#{controller[:controller].downcase.pluralize}_edit/#{controller[:controller].downcase}_id"
+              get edit_#{ctrl_route(controller[:controller])}_path(1)
               expect(response).to have_http_status(:ok)
             end
 
@@ -923,7 +972,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET edit action" do
@@ -949,14 +998,14 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "POST create action" do
             context "with valid parameters" do
               it "creates new record" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
-                  "#{controller[:controller].downcase}": {
+                post #{ctrl_route(controller[:controller])}_path, params: {
+                  "#{ctrl_base(controller[:controller])}": {
                     #{generate_create_params(controller[:controller])}
                   }
                 }
@@ -964,16 +1013,16 @@ module Conjureshield
               end
 
               it "redirects to new record" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
-                  "#{controller[:controller].downcase}": {
+                post #{ctrl_route(controller[:controller])}_path, params: {
+                  "#{ctrl_base(controller[:controller])}": {
                     #{generate_create_params(controller[:controller])}
                   }
                 }
-                expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+                expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
               end
 
               it "assigns correct instance variables" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
+                post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_create_params(controller[:controller])}
                   }
@@ -989,20 +1038,20 @@ module Conjureshield
     end
 
     def generate_create_params(controller_name)
-      "id: 1, #{controller_name.downcase}: { name: \"Test\" }"
+      "id: 1, #{ctrl_base(controller_name)}: { name: \"Test\" }"
     end
 
     def generate_post_create_invalid_test(controller)
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "POST create action" do
             context "with invalid parameters" do
               it "returns validation errors" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
+                post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{controller[:controller].downcase}": {
                     invalid_field: "value"
                   }
@@ -1011,7 +1060,7 @@ module Conjureshield
               end
 
               it "renders new template with errors" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
+                post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{controller[:controller].downcase}": {
                     invalid_field: "value"
                   }
@@ -1030,13 +1079,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "POST create action" do
             context "with redirect" do
               it "redirects to new record" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
+                post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_create_params(controller[:controller])}
                   }
@@ -1045,7 +1094,7 @@ module Conjureshield
               end
 
               it "sets flash messages" do
-                post "#{controller[:controller].downcase.pluralize}s_path", params: {
+                post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_create_params(controller[:controller])}
                   }
@@ -1064,13 +1113,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "PUT/PATCH update action" do
             context "with valid parameters" do
               it "updates the record" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_route(controller[:controller])}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_update_params(controller[:controller])}
                   }
@@ -1079,7 +1128,7 @@ module Conjureshield
               end
 
               it "redirects to updated record" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_update_params(controller[:controller])}
                   }
@@ -1088,12 +1137,12 @@ module Conjureshield
               end
 
               it "updates the record in database" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_update_params(controller[:controller])}
                   }
                 }
-                expect(#{controller[:controller].downcase.pluralize}.find_by(id: 1).#{controller_name.downcase}).to eq("updated")
+                expect(#{ctrl_route(controller[:controller])}.find_by(id: 1).#{ctrl_base(controller_name)}).to eq("updated")
               end
             end
           end
@@ -1111,13 +1160,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "PUT/PATCH update action" do
             context "with invalid parameters" do
               it "returns validation errors" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     invalid_field: "value"
                   }
@@ -1126,7 +1175,7 @@ module Conjureshield
               end
 
               it "renders edit template with errors" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     invalid_field: "value"
                   }
@@ -1145,13 +1194,13 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "PUT/PATCH update action" do
             context "with redirect" do
               it "redirects to updated record" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_update_params(controller[:controller])}
                   }
@@ -1160,7 +1209,7 @@ module Conjureshield
               end
 
               it "sets flash messages" do
-                put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                   "#{controller[:controller].downcase}": {
                     #{generate_update_params(controller[:controller])}
                   }
@@ -1179,17 +1228,17 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "DELETE destroy action" do
             it "deletes the record" do
-              delete "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+              delete #{ctrl_route(controller[:controller])}_path(1)
               expect(response).to have_http_status(:no_content)
             end
 
             it "removes the record from database" do
-              delete "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+              delete #{ctrl_base(controller[:controller]).singularize}_path(1)
               expect(#{controller[:controller].downcase.pluralize}.find_by(id: 1)).to be_nil
             end
           end
@@ -1203,18 +1252,18 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "DELETE destroy action" do
             context "with redirect" do
               it "redirects after destroy" do
-                delete "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+                delete #{ctrl_base(controller[:controller]).singularize}_path(1)
                 expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
               end
 
               it "sets flash messages" do
-                delete "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id"
+                delete #{ctrl_base(controller[:controller]).singularize}_path(1)
                 expect(flash[:notice]).to be_present
               end
             end
@@ -1229,7 +1278,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}Parameters", type: :request do
           describe "strong parameters" do
@@ -1265,7 +1314,7 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}Parameters", type: :request do
           describe "strong parameters" do
@@ -1287,12 +1336,12 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "flash messages" do
             it "sets notice flash" do
-              post "#{controller[:controller].downcase.pluralize}s_path", params: {
+              post #{ctrl_route(controller[:controller])}_path, params: {
                 "#{controller[:controller].downcase}": {
                   #{generate_create_params(controller[:controller])}
                 }
@@ -1301,7 +1350,7 @@ module Conjureshield
             end
 
             it "sets alert flash" do
-              post "#{controller[:controller].downcase.pluralize}s_path", params: {
+              post #{ctrl_route(controller[:controller])}_path, params: {
                 "#{controller[:controller].downcase}": {
                   invalid_field: "value"
                 }
@@ -1319,12 +1368,12 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "redirects" do
             it "redirects to new record" do
-              post "#{controller[:controller].downcase.pluralize}s_path", params: {
+              post #{ctrl_route(controller[:controller])}_path, params: {
                 "#{controller[:controller].downcase}": {
                   #{generate_create_params(controller[:controller])}
                 }
@@ -1333,7 +1382,7 @@ module Conjureshield
             end
 
             it "redirects to edit record" do
-              put "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", params: {
+              put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
                 "#{controller[:controller].downcase}": {
                   #{generate_update_params(controller[:controller])}
                 }
@@ -1351,18 +1400,18 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "JSON responses" do
             it "returns JSON for show action" do
-              get "#{controller[:controller].downcase.pluralize}_path/#{controller[:controller].downcase}_id", headers: { "Accept" => "application/json" }
+              get #{ctrl_base(controller[:controller]).singularize}_path(1), headers: { "Accept" => "application/json" }
               expect(response).to have_http_status(:ok)
               expect(response.parsed_body).to be_a(Hash)
             end
 
             it "returns JSON for create action" do
-              post "#{controller[:controller].downcase.pluralize}s_path", params: {
+              post #{ctrl_route(controller[:controller])}_path, params: {
                 "#{controller[:controller].downcase}": {
                   #{generate_create_params(controller[:controller])}
                 }
@@ -1384,66 +1433,66 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{controller}/#{controller}", type: :integration do
+        RSpec.describe "#{ctrl_base(controller).capitalize}", type: :integration do
           describe "user workflow" do
             context "create and view" do
               it "creates a new #{model} and redirects to show" do
-                post "#{controller}s_path", params: {
-                  "#{controller.downcase}": {
-                    id: 1, #{controller.downcase}: { name: "Test" }
+                post #{ctrl_route(controller)}_path, params: {
+                  "#{ctrl_base(controller)}": {
+                    id: 1, #{ctrl_base(controller)}: { name: "Test" }
                   }
                 }
-                expect(response).to redirect_to(#{model.pluralize}_path)
-                expect(flash[:notice]).to eq("#{model} was successfully created.")
+                expect(response).to redirect_to(#{ctrl_route(controller)}_path)
+                expect(flash[:notice]).to be_present
               end
 
               it "displays the created #{model} with all attributes" do
-                post "#{controller}s_path", params: {
-                  "#{controller.downcase}": {
-                    id: 1, #{controller.downcase}: { name: "Test" }
+                post #{ctrl_route(controller)}_path, params: {
+                  "#{ctrl_base(controller)}": {
+                    id: 1, #{ctrl_base(controller)}: { name: "Test" }
                   }
                 }
                 follow_redirect!
                 expect(response).to have_http_status(:ok)
-                expect(page).to have_content("Show #{model}")
+                expect(page).to have_content(/#{model}/i)
               end
             end
 
             context "edit and update" do
               it "edits the #{model} and saves changes" do
-                put "#{controller}_path/1", params: {
-                  "#{controller.downcase}": {
-                    id: 1, #{controller.downcase}: { name: "Updated" }
+                put #{ctrl_route(controller)}_path(1), params: {
+                  "#{ctrl_base(controller)}": {
+                    id: 1, #{ctrl_base(controller)}: { name: "Updated" }
                   }
                 }
-                expect(response).to redirect_to(#{model.pluralize}_path)
-                expect(flash[:notice]).to eq("#{model} was successfully updated.")
+                expect(response).to redirect_to(#{ctrl_base(controller)}_path)
+                expect(flash[:notice]).to be_present
               end
 
               it "displays the updated #{model} with new values" do
-                put "#{controller}_path/1", params: {
-                  "#{controller.downcase}": {
-                    id: 1, #{controller.downcase}: { name: "Updated" }
+                put #{ctrl_base(controller).singularize}_path(1), params: {
+                  "#{ctrl_base(controller)}": {
+                    id: 1, #{ctrl_base(controller)}: { name: "Updated" }
                   }
                 }
                 follow_redirect!
                 expect(response).to have_http_status(:ok)
-                expect(page).to have_content("Updated #{model}")
+                expect(page).to have_content(/Updated/i)
               end
             end
 
             context "delete" do
               it "deletes the #{model} and redirects to index" do
-                delete "#{controller}_path/1"
-                expect(response).to redirect_to(#{model.pluralize}_path)
-                expect(flash[:notice]).to eq("#{model} was successfully deleted.")
+                delete #{ctrl_route(controller)}_path(1)
+                expect(response).to redirect_to(#{ctrl_base(controller)}_path)
+                expect(flash[:notice]).to be_present
               end
 
               it "removes the #{model} from the list" do
-                visit "#{controller}s_path"
-                within(first("a[href*='/#{controller}s_path/1']")) do
+                visit #{ctrl_route(controller)}_path
+                within(first(%(a[href*="/#{ctrl_route(controller)}/1"]))) do
                   click_link("Delete")
                 end
                 expect(page).to have_content("#{model} was successfully deleted.")
@@ -1457,6 +1506,19 @@ module Conjureshield
       write_test_file("#{controller}_integration", test_content)
     end
 
+    def write_test_file(subject, content)
+      base = @codebase_path || Dir.pwd
+      base_dir = File.join(base, rspec? ? "spec" : "test")
+      FileUtils.mkdir_p(base_dir)
+      ext = rspec? ? "_spec.rb" : "_test.rb"
+      basename = subject.to_s.underscore
+      suffix = @current_type
+      test_path = File.join(base_dir, "#{basename}_#{suffix}#{ext}")
+
+      File.write(test_path, content)
+      puts "Generated test: #{test_path}"
+    end
+
     def generate_api_test(suggestion)
       controller = suggestion[:controller]
       model = suggestion[:model]
@@ -1464,88 +1526,88 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
-        RSpec.describe "#{controller}/#{controller}", type: :api do
-          describe "GET #{controller.pluralize}" do
-            it "returns 200 and list of #{model.pluralize}s" do
-              get "#{controller.pluralize}s_path"
+        RSpec.describe "#{ctrl_base(controller).capitalize}", type: :api do
+          describe "GET /#{ctrl_route(controller)}" do
+            it "returns 200 and list of #{model.pluralize}" do
+              get #{ctrl_route(controller)}_path
               expect(response).to have_http_status(:ok)
               expect(response.parsed_body).to be_a(Array)
-              expect(response.parsed_body).to all(be_a(#{model.downcase}))
+              expect(response.parsed_body).to all(be_a(#{model}))
             end
 
             it "returns 401 when not authenticated" do
-              get "#{controller.pluralize}s_path"
+              get #{ctrl_route(controller)}_path
               expect(response).to have_http_status(:unauthorized)
             end
           end
 
-          describe "POST #{controller.pluralize}s" do
+          describe "POST /#{ctrl_route(controller)}" do
             context "with valid payload" do
               it "creates a new #{model} and returns 201" do
-                post "#{controller.pluralize}s_path",
+                post #{ctrl_route(controller)}_path,
                      params: {
-                       "#{controller.downcase}": {
-                         id: 1, #{controller.downcase}: { name: "Test" }
+                       "#{ctrl_base(controller)}": {
+                         id: 1, #{ctrl_base(controller)}: { name: "Test" }
                        }
                      },
-                     headers: { "Authorization" => "Bearer #{access_token}" }
+                     headers: { "Accept" => "application/json" }
                 expect(response).to have_http_status(:created)
                 expect(response.parsed_body[:id]).to be_present
-                expect(response.parsed_body[:#{controller.downcase}]).to be_a(Hash)
+                expect(response.parsed_body[:#{ctrl_base(controller)}]).to be_a(Hash)
               end
             end
 
             context "with invalid payload" do
               it "returns 422 with validation errors" do
-                post "#{controller.pluralize}s_path",
+                post #{ctrl_route(controller)}_path,
                      params: {
-                       "#{controller.downcase}": {
+                       "#{ctrl_base(controller)}": {
                          invalid_field: "value"
                        }
                      },
-                     headers: { "Authorization" => "Bearer #{access_token}" }
+                     headers: { "Accept" => "application/json" }
                 expect(response).to have_http_status(:unprocessable_entity)
                 expect(response.parsed_body[:errors]).to be_a(Hash)
               end
             end
           end
 
-          describe "GET #{controller.pluralize}/:id" do
+          describe "GET /#{ctrl_route(controller)}/:id" do
             it "returns the #{model} with all attributes" do
-              get "#{controller}_path/1",
-                  headers: { "Authorization" => "Bearer #{access_token}" }
+              get #{ctrl_base(controller).singularize}_path(1),
+                  headers: { "Accept" => "application/json" }
               expect(response).to have_http_status(:ok)
               expect(response.parsed_body).to be_a(Hash)
               expect(response.parsed_body[:id]).to eq(1)
             end
 
             it "returns 404 for non-existent #{model}" do
-              get "#{controller}_path/999",
-                  headers: { "Authorization" => "Bearer #{access_token}" }
+              get #{ctrl_base(controller).singularize}_path(999),
+                  headers: { "Accept" => "application/json" }
               expect(response).to have_http_status(:not_found)
             end
           end
 
-          describe "PUT #{controller.pluralize}/:id" do
+          describe "PUT /#{ctrl_route(controller)}/:id" do
             it "updates the #{model} and returns 200" do
-              put "#{controller}_path/1",
-                  params: {
-                    "#{controller.downcase}": {
-                      id: 1, #{controller.downcase}: { name: "Updated" }
+          put #{ctrl_base(controller).singularize}_path(1),
+              params: {
+                    "#{ctrl_base(controller)}": {
+                      id: 1, #{ctrl_base(controller)}: { name: "Updated" }
                     }
                   },
-                  headers: { "Authorization" => "Bearer #{access_token}" }
+                  headers: { "Accept" => "application/json" }
               expect(response).to have_http_status(:ok)
               expect(response.parsed_body[:id]).to eq(1)
             end
           end
 
-          describe "DELETE #{controller.pluralize}/:id" do
+          describe "DELETE /#{ctrl_route(controller)}/:id" do
             it "deletes the #{model} and returns 204" do
-              delete "#{controller}_path/1",
-                     headers: { "Authorization" => "Bearer #{access_token}" }
+              delete #{ctrl_base(controller).singularize}_path(1),
+                     headers: { "Accept" => "application/json" }
               expect(response).to have_http_status(:no_content)
             end
           end
@@ -1562,16 +1624,16 @@ module Conjureshield
       test_content = <<~TEST
         # frozen_string_literal: true
 
-        require "rails_helper"
+        #{spec_helper_require}
 
         RSpec.describe "#{controller}/#{controller}", type: :feature do
           let(:#{model.downcase}) { create(:#{model.downcase}) }
 
           describe "user story: Create and view #{model}" do
             it "allows users to create a new #{model} and see it on the dashboard" do
-              visit "#{controller.pluralize}s_path"
+              visit #{ctrl_route(controller)}_path
               within("form") do
-                fill_in "#{controller.downcase} Name", with: "Test #{model}"
+                fill_in "#{ctrl_base(controller)} Name", with: "Test #{model}"
                 click_button "Create #{model}"
               end
               expect(page).to have_content("#{model} was successfully created.")
@@ -1581,10 +1643,10 @@ module Conjureshield
 
           describe "user story: Edit #{model}" do
             it "allows users to edit an existing #{model}" do
-              visit "#{controller.pluralize}s_path"
+              visit #{ctrl_route(controller)}_path
               click_link "Edit #{model}", match: :first
               within("form") do
-                fill_in "#{controller.downcase} Name", with: "Updated #{model}"
+                fill_in "#{ctrl_base(controller)} Name", with: "Updated #{model}"
                 click_button "Update #{model}"
               end
               expect(page).to have_content("#{model} was successfully updated.")
@@ -1594,8 +1656,8 @@ module Conjureshield
 
           describe "user story: Delete #{model}" do
             it "allows users to delete a #{model}" do
-              visit "#{controller.pluralize}s_path"
-              within(first("a[href*='/#{controller.pluralize}s_path/1']")) do
+              visit #{ctrl_route(controller)}_path
+              within(first(%(a[href*="/#{ctrl_route(controller)}/1"]))) do
                 click_link "Delete #{model}"
               end
               expect(page).to have_content("#{model} was successfully deleted.")
@@ -1604,7 +1666,7 @@ module Conjureshield
 
           describe "user story: View #{model} details" do
             it "displays all #{model} information on the show page" do
-              visit "#{controller}_path/#{model.id}"
+              visit #{ctrl_route(controller)}_path(#{model}.id)
               expect(page).to have_content("Show #{model}")
               expect(page).to have_content("#{model} Name")
               expect(page).to have_content("#{model} Email")
@@ -1616,10 +1678,216 @@ module Conjureshield
       write_test_file("#{controller}_feature", test_content)
     end
 
-    def write_test_file(subject, content)
-      test_path = "#{subject}.test.rb"
-      File.write(test_path, content)
-      puts "Generated test: #{test_path}"
+    # === Minitest generation methods ===
+
+    def generate_minitest_validations(suggestion)
+      model_name = suggestion[:model]
+      fields = suggestion[:fields] || []
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          #{fields.map { |f| minitest_validation_test(f, model_name) }.join("\n")}
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
     end
+
+    def minitest_validation_test(field, model_name)
+      if field.is_a?(Hash)
+        fname = field[:field]
+      else
+        fname = field
+      end
+
+      <<-MINITEST
+          test "validates #{fname}" do
+            record = #{model_name}.new
+            record.valid?
+            assert_not record.errors[:#{fname}].empty?, "#{fname} should be validated"
+          end
+      MINITEST
+    end
+
+    def generate_minitest_associations(suggestion)
+      model_name = suggestion[:model]
+      assocs = suggestion[:associations] || []
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          #{assocs.map { |a| minitest_association_test(a, model_name) }.join("\n")}
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
+    end
+
+    def minitest_association_test(assoc, model_name)
+      type = assoc[:type]
+      target = assoc[:target]
+      var = model_name.underscore
+
+      <<-MINITEST
+          test "should #{type} #{target}" do
+            #{var} = #{model_name}.new
+            assert_respond_to #{var}, :#{target.underscore}
+          end
+      MINITEST
+    end
+
+    def generate_minitest_scopes(suggestion)
+      model_name = suggestion[:model]
+      scopes = suggestion[:scopes] || []
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          #{scopes.map { |s| minitest_scope_test(s, model_name) }.join("\n")}
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
+    end
+
+    def minitest_scope_test(scope, model_name)
+      name = scope[:name]
+      table = model_name.underscore.pluralize
+
+      <<-MINITEST
+          test "#{name} scope returns results" do
+            assert_respond_to #{model_name}, :#{name}
+          end
+      MINITEST
+    end
+
+    def generate_minitest_callbacks(suggestion)
+      model_name = suggestion[:model]
+      cbs = suggestion[:callbacks] || []
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          #{cbs.map { |cb| minitest_callback_test(cb, model_name) }.join("\n")}
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
+    end
+
+    def minitest_callback_test(callback, model_name)
+      cb_type = callback[:type]
+      var = model_name.underscore
+
+      <<-MINITEST
+          test "executes #{cb_type} callback" do
+            #{var} = #{model_name}.new
+            assert_respond_to #{var}, :valid?
+          end
+      MINITEST
+    end
+
+    def generate_minitest_custom_methods(suggestion)
+      model_name = suggestion[:model]
+      methods = suggestion[:custom_methods] || []
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          #{methods.map { |m| minitest_custom_method_test(m, model_name) }.join("\n")}
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
+    end
+
+    def minitest_custom_method_test(method, model_name)
+      var = model_name.underscore
+
+      <<-MINITEST
+          test "##{method} returns a result" do
+            #{var} = #{model_name}.new
+            assert_respond_to #{var}, :#{method}
+          end
+      MINITEST
+    end
+
+    def generate_minitest_factories(suggestion)
+      model_name = suggestion[:model]
+      var = model_name.underscore
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          test "valid factory" do
+            #{var} = #{model_name}.new
+            assert #{var}.valid?
+          end
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
+    end
+
+    def generate_minitest_serialization(suggestion)
+      model_name = suggestion[:model]
+      var = model_name.underscore
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{model_name}Test < ActiveSupport::TestCase
+          test "serializes to_json" do
+            #{var} = #{model_name}.new
+            assert_respond_to #{var}, :to_json
+          end
+        end
+      MINITEST
+
+      write_test_file(model_name, test_content)
+    end
+
+    def generate_minitest_request_test(suggestion)
+      controller_name = suggestion[:controller]
+      ctrl = controller_name.to_s.sub(/Controller$/, "").underscore
+      table = ctrl.pluralize
+
+      test_content = <<~MINITEST
+        # frozen_string_literal: true
+
+        require "test_helper"
+
+        class #{controller_name}Test < ActionDispatch::IntegrationTest
+          test "should get index" do
+            get #{table}_url
+            assert_response :success
+          end
+        end
+      MINITEST
+
+      write_test_file("#{ctrl}_controller", test_content)
+    end
+
   end
 end

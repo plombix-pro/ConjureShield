@@ -10,7 +10,20 @@ require "nokogiri"
 
 module Conjureshield
   class Analyzer
-    attr_reader :codebase_path, :files, :ast_nodes, :missing_tests, :existing_tests
+    RESTFUL_ACTIONS = %i[index show new create edit update destroy].freeze
+    SINGULAR_ACTIONS = %i[show new create edit update destroy].freeze
+
+    ACTION_ROUTE_MAP = {
+      index: [:get_index, :index_pagination, :index_sorting],
+      show: [:get_show, :show_with_associations],
+      new: [:get_new, :new_form],
+      create: [:post_create, :post_create_valid, :post_create_invalid, :post_create_redirect],
+      edit: [:get_edit, :edit_form],
+      update: [:put_patch_update_valid, :put_patch_update_invalid, :put_patch_update_redirect],
+      destroy: [:delete_destroy, :delete_destroy_redirect]
+    }.freeze
+
+    attr_reader :codebase_path, :files, :ast_nodes, :missing_tests, :existing_tests, :routes, :routes_parsed
 
     def initialize(path)
       @codebase_path = File.expand_path(path)
@@ -18,12 +31,15 @@ module Conjureshield
       @missing_tests = []
       @existing_tests = []
       @files = []
+      @routes = {}
+      @routes_parsed = false
     end
 
     def analyze
       scan_ruby_files
       scan_existing_tests
       analyze_ast
+      parse_routes
       detect_missing_tests
       self
     end
@@ -162,11 +178,12 @@ module Conjureshield
         def visit_call_node(node)
           if node.name == :scope && node.arguments&.arguments&.any?
             arg = node.arguments.arguments.first
-            if arg.is_a?(Prism::StringNode)
-              @scopes << arg.content
-            elsif arg.is_a?(Prism::SymbolNode)
-              @scopes << arg.value
-            end
+            name = if arg.is_a?(Prism::StringNode)
+                     arg.content
+                   elsif arg.is_a?(Prism::SymbolNode)
+                     arg.value
+                   end
+            @scopes << { name: name, args: [] } if name
           end
           super
         end
@@ -179,31 +196,31 @@ module Conjureshield
     end
 
     def extract_validations(file, ast)
-      visitor = Class.new(Prism::Visitor) do
-        attr_reader :validations
+      content = @files.find { |f| f[:path] == file }&.dig(:content) || ""
+      validations = []
 
-        def initialize
-          @validations = []
-        end
+      content.each_line do |line|
+        next unless line =~ /validates\s+(?::)?(\w[\w!?]*)/
 
-        def visit_call_node(node)
-          if node.name == :validates && node.arguments&.arguments&.any?
-            node.arguments.arguments.each do |arg|
-              if arg.is_a?(Prism::SymbolNode)
-                @validations << arg.value
-              elsif arg.is_a?(Prism::StringNode)
-                @validations << arg.content
-              end
-            end
-          end
-          super
-        end
-      end.new
+        field = $1
+        validators = []
+        validators << :presence if line.include?("presence:")
+        validators << :uniqueness if line.include?("uniqueness:")
+        validators << :length if line.include?("length:")
+        validators << :format if line.include?("format:")
+        validators << :inclusion if line.include?("inclusion:")
+        validators << :exclusion if line.include?("exclusion:")
+        validators << :confirmation if line.include?("confirmation:")
+        validators << :acceptance if line.include?("acceptance:")
+        validators << :numericality if line.include?("numericality:")
+        validators << :comparison if line.include?("comparison:")
 
-      visitor.visit(ast)
-      return if visitor.validations.empty?
+        validations << { field: field, validators: validators }
+      end
 
-      @ast_nodes << { file: file, validations: visitor.validations, type: :validations }
+      return if validations.empty?
+
+      @ast_nodes << { file: file, validations: validations, type: :validations }
     end
 
     def extract_associations(file, ast)
@@ -217,7 +234,14 @@ module Conjureshield
         end
 
         def visit_call_node(node)
-          @associations << node.name if @targets.include?(node.name)
+          if @targets.include?(node.name)
+            target = nil
+            if node.arguments&.arguments&.first
+              arg = node.arguments.arguments.first
+              target = arg.value if arg.respond_to?(:value)
+            end
+            @associations << { type: node.name, target: target&.to_s&.classify }
+          end
           super
         end
       end.new
@@ -316,52 +340,226 @@ module Conjureshield
       blocks
     end
 
+    def parse_routes
+      routes_file = File.join(@codebase_path, "config", "routes.rb")
+      return unless File.exist?(routes_file)
+
+      @routes_parsed = true
+
+      content = File.read(routes_file)
+      prefix_stack = []
+      block_stack = []
+
+      content.each_line do |line|
+        stripped = line.strip
+        next if stripped.empty? || stripped.start_with?("#")
+
+        if stripped =~ /\Aend\b/
+          popped = block_stack.pop
+          prefix_stack.pop if [:namespace, :scope_module].include?(popped)
+          next
+        end
+
+        if stripped =~ /\bnamespace\s+(?::|["'])(\w+)\s+do\b/
+          block_stack << :namespace
+          prefix_stack << $1.camelize
+          next
+        end
+
+        if stripped =~ /\bscope\s+module:\s*(?::|["'])(\w+)["']?\s+do\b/
+          block_stack << :scope_module
+          prefix_stack << $1.camelize
+          next
+        end
+
+        if stripped =~ /\b(resources|resource|member|collection|concern)\s+.*\bdo\b/
+          block_stack << :other
+        end
+
+        prefix = prefix_stack.any? ? prefix_stack.join("::") + "::" : ""
+
+        if stripped =~ /\bresources\s+(?::|["'])(\w+)/
+          resource_name = $1
+          controller = "#{prefix}#{resource_name.camelize}Controller"
+          actions = parse_route_options($', RESTFUL_ACTIONS)
+          register_controller_routes(controller, actions)
+          next
+        end
+
+        if stripped =~ /\bresource\s+(?::|["'])(\w+)/
+          resource_name = $1
+          controller = "#{prefix}#{resource_name.camelize}Controller"
+          actions = parse_route_options($', SINGULAR_ACTIONS)
+          register_controller_routes(controller, actions)
+          next
+        end
+
+        if stripped =~ /\b(get|post|put|patch|delete|match)\s+["'].*?["'].*\bto:\s*["'](\w+)#(\w+)["']/
+          controller = "#{prefix}#{$2.camelize}Controller"
+          register_controller_routes(controller, [$3.to_sym])
+          next
+        end
+
+        if stripped =~ /\b(get|post|put|patch|delete|match)\s+["'].*?["']\s*=>\s*["'](\w+)#(\w+)["']/
+          controller = "#{prefix}#{$2.camelize}Controller"
+          register_controller_routes(controller, [$3.to_sym])
+          next
+        end
+      end
+    end
+
+    def parse_route_options(rest, default_actions)
+      if rest =~ /only:\s*\[([^\]]*)\]/
+        $1.split(",").map { |s| s.strip.gsub(/[":\[\]']/, "").to_sym } & default_actions
+      elsif rest =~ /except:\s*\[([^\]]*)\]/
+        default_actions - $1.split(",").map { |s| s.strip.gsub(/[":\[\]']/, "").to_sym }
+      else
+        default_actions.dup
+      end
+    end
+
+    def register_controller_routes(controller, actions)
+      @routes[controller] = (@routes[controller] || []) + actions
+      @routes[controller].uniq!
+    end
+
+    def routable_actions_for(controller_name)
+      @routes.fetch(controller_name, [])
+    end
+
     def detect_missing_tests
       models = @ast_nodes.select { |n| n[:type] == :model }
       controllers = @ast_nodes.select { |n| n[:type] == :controller }
 
-      # 1. Evaluate missing Model tests
       models.each do |model_node|
+        next if model_node[:model] == "ApplicationRecord"
         expected_spec = "#{File.basename(model_node[:file], '.rb')}_spec.rb"
         has_test = @existing_tests.any? { |t| t[:filename] == expected_spec }
 
         unless has_test
-          # Formatted as Hashes so suggestion[:name] works in your CLI
-          suggestions = [
-            { name: "Verify model initialization structure", type: :init }
-          ]
-          
+          suggestions = []
+          model_name = model_node[:model]
+
           if model_node.dig(:metadata, :validations)&.any?
-            suggestions << { name: "Test active validations", type: :validations }
+            suggestions << {
+              name: "Test active validations",
+              type: :validations,
+              model: model_name,
+              fields: model_node[:metadata][:validations],
+              validations: model_node[:metadata][:validations]
+            }
           end
-          
+
           if model_node.dig(:metadata, :associations)&.any?
-            suggestions << { name: "Test active associations", type: :associations }
+            assoc_types = model_node[:metadata][:associations].map { |a| a[:type] }.uniq
+            assoc_types.each do |assoc_type|
+              suggestions << {
+                name: "Test #{assoc_type} associations",
+                type: assoc_type,
+                model: model_name,
+                associations: model_node[:metadata][:associations]
+              }
+            end
           end
+
+          if model_node.dig(:metadata, :scopes)&.any?
+            suggestions << {
+              name: "Test model scopes",
+              type: :scopes,
+              model: model_name,
+              scopes: model_node[:metadata][:scopes]
+            }
+          end
+
+          cb = model_node.dig(:metadata, :callbacks) || []
+          cb.each do |callback_name|
+            suggestions << {
+              name: "Test #{callback_name} callback",
+              type: callback_name,
+              model: model_name,
+              callbacks: cb.map { |c| { type: c } }
+            }
+          end
+
+          if model_node.dig(:metadata, :custom_methods)&.any?
+            suggestions << {
+              name: "Test custom methods",
+              type: :custom_methods,
+              model: model_name,
+              custom_methods: model_node[:metadata][:custom_methods]
+            }
+          end
+
+          if model_node.dig(:metadata, :delegation)&.any?
+            suggestions << {
+              name: "Test delegation",
+              type: :delegation,
+              model: model_name
+            }
+          end
+
+          suggestions << {
+            name: "Test factory",
+            type: :factories,
+            model: model_name
+          }
 
           @missing_tests << {
             type: :unit,
-            model: model_node[:model],
+            model: model_name,
             file: model_node[:file],
             suggestions: suggestions
           }
         end
       end
 
-      # 2. Evaluate missing Controller tests
       controllers.each do |controller_node|
+        controller_name = controller_node[:controller]
+        next if controller_name == "ApplicationController"
+
         expected_spec = "#{File.basename(controller_node[:file], '.rb')}_spec.rb"
         has_test = @existing_tests.any? { |t| t[:filename] == expected_spec }
 
         unless has_test
+          routable = routable_actions_for(controller_name)
+          next if @routes_parsed && routable.empty?
+
+          inferred_model = controller_name.sub(/Controller$/, "").singularize
+
+          suggestions = []
+
+          if !@routes_parsed || routable.include?(:index)
+            suggestions << {
+              name: "Test standard GET #index response parameters",
+              type: :get_index,
+              controller: controller_name,
+              model: inferred_model
+            }
+          end
+
+          if !@routes_parsed || routable.include?(:create)
+            suggestions << {
+              name: "Test POST #create branch handling",
+              type: :post_create,
+              controller: controller_name,
+              model: inferred_model
+            }
+          end
+
+          if !@routes_parsed || routable.include?(:show)
+            suggestions << {
+              name: "Test GET #show",
+              type: :get_show,
+              controller: controller_name,
+              model: inferred_model
+            }
+          end
+
           @missing_tests << {
             type: :request,
-            controller: controller_node[:controller],
+            controller: controller_name,
             file: controller_node[:file],
-            suggestions: [
-              { name: "Test standard GET #index response parameters", type: :get_index },
-              { name: "Test POST #create branch handling", type: :post_create }
-            ]
+            suggestions: suggestions
           }
         end
       end
