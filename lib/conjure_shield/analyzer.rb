@@ -17,6 +17,7 @@ module Conjureshield
       @ast_nodes = []
       @missing_tests = []
       @existing_tests = []
+      @files = []
     end
 
     def analyze
@@ -66,24 +67,58 @@ module Conjureshield
       end
     end
 
-    def extract_model_info(file, ast)
-      model_name = File.basename(file, ".rb").capitalize
-      return unless model_name
+    def scan_existing_tests
+      # Look for both RSpec and Minitest structures safely
+      Dir.glob("#{codebase_path}/{spec,test}/**/*_{spec,test}.rb").each do |file|
+        next if file.include?("/vendor/") || file.include?("/node_modules/")
 
+        @existing_tests << {
+          file: file,
+          filename: File.basename(file)
+        }
+      end
+    end
+
+    def analyze_ast
+      # Gather all granular metadata fragments found by your visitors
+      metadata_nodes = @ast_nodes.select do |n| 
+        [:callbacks, :validations, :scopes, :associations, :custom_methods, :delegation].include?(n[:type]) 
+      end
+      
+      # Find the primary component definitions
+      primary_components = @ast_nodes.select { |n| [:model, :controller, :serializer, :helper].include?(n[:type]) }
+
+      # Cross-reference and enrich the primary components with their specific features
+      # This keeps @ast_nodes flat so your CLI counters still work!
+      primary_components.each do |component|
+        component[:metadata] ||= {}
+        
+        file_metadata = metadata_nodes.select { |meta| meta[:file] == component[:file] }
+        file_metadata.each do |meta|
+          payload_key = meta[:type]
+          component[:metadata][payload_key] = meta[payload_key] || meta[:methods] || meta[:delegations]
+        end
+      end
+    end
+
+    def extract_model_info(file, ast)
+      return unless file.include?("/app/models/")
+      
+      model_name = File.basename(file, ".rb").split('_').map(&:capitalize).join
       @ast_nodes << { file: file, model: model_name, type: :model }
     end
 
     def extract_controller_info(file, ast)
-      controller_name = File.basename(file, ".rb").capitalize
-      return unless controller_name
-
+      return unless file.include?("/app/controllers/")
+      
+      controller_name = File.basename(file, ".rb").split('_').map(&:capitalize).join
       @ast_nodes << { file: file, controller: controller_name, type: :controller }
     end
 
     def extract_serializer_info(file, ast)
-      serializer_name = File.basename(file, ".rb").capitalize
-      return unless serializer_name
-
+      return unless file.include?("/app/serializers/")
+      
+      serializer_name = File.basename(file, ".rb").split('_').map(&:capitalize).join
       @ast_nodes << { file: file, serializer: serializer_name, type: :serializer }
     end
 
@@ -94,78 +129,125 @@ module Conjureshield
     end
 
     def extract_callbacks(file, ast)
-      callbacks = []
-      ast.each_node(:send) do |node|
-        callback_methods = [:before_save, :after_save, :before_create, :after_create,
-                           :before_update, :after_update, :before_destroy, :after_destroy,
-                           :before_validation, :after_validation, :around_save, :around_create]
-        if callback_methods.include?(node.method_name)
-          callbacks << node.method_name
-        end
-      end
-      return if callbacks.empty?
+      visitor = Class.new(Prism::Visitor) do
+        attr_reader :callbacks
 
-      @ast_nodes << { file: file, callbacks: callbacks, type: :callbacks }
+        def initialize
+          @callbacks = []
+          @targets = [:before_save, :after_save, :before_create, :after_create,
+                      :before_update, :after_update, :before_destroy, :after_destroy,
+                      :before_validation, :after_validation, :around_save, :around_create]
+        end
+
+        def visit_call_node(node)
+          @callbacks << node.name if @targets.include?(node.name)
+          super
+        end
+      end.new
+
+      visitor.visit(ast)
+      return if visitor.callbacks.empty?
+
+      @ast_nodes << { file: file, callbacks: visitor.callbacks, type: :callbacks }
     end
 
     def extract_scopes(file, ast)
-      scopes = []
-      ast.each_node(:send) do |node|
-        if node.method_name == :scope && node.arguments.any?
-          scopes << node.arguments[0].children[0] if node.arguments[0].is_a?(Prism::Nodes::String)
-        end
-      end
-      return if scopes.empty?
+      visitor = Class.new(Prism::Visitor) do
+        attr_reader :scopes
 
-      @ast_nodes << { file: file, scopes: scopes, type: :scopes }
+        def initialize
+          @scopes = []
+        end
+
+        def visit_call_node(node)
+          if node.name == :scope && node.arguments&.arguments&.any?
+            arg = node.arguments.arguments.first
+            if arg.is_a?(Prism::StringNode)
+              @scopes << arg.content
+            elsif arg.is_a?(Prism::SymbolNode)
+              @scopes << arg.value
+            end
+          end
+          super
+        end
+      end.new
+
+      visitor.visit(ast)
+      return if visitor.scopes.empty?
+
+      @ast_nodes << { file: file, scopes: visitor.scopes, type: :scopes }
     end
 
     def extract_validations(file, ast)
-      validations = []
-      ast.each_node(:send) do |node|
-        if node.method_name == :validates
-          node.arguments.each do |arg|
-            if arg.is_a?(Prism::Nodes::Array)
-              arg.children.each do |child|
-                if child.is_a?(Prism::Nodes::Symbol)
-                  validations << child.children[0]
-                elsif child.is_a?(Prism::Nodes::String)
-                  validations << child.children[0]
-                end
+      visitor = Class.new(Prism::Visitor) do
+        attr_reader :validations
+
+        def initialize
+          @validations = []
+        end
+
+        def visit_call_node(node)
+          if node.name == :validates && node.arguments&.arguments&.any?
+            node.arguments.arguments.each do |arg|
+              if arg.is_a?(Prism::SymbolNode)
+                @validations << arg.value
+              elsif arg.is_a?(Prism::StringNode)
+                @validations << arg.content
               end
             end
           end
+          super
         end
-      end
-      return if validations.empty?
+      end.new
 
-      @ast_nodes << { file: file, validations: validations, type: :validations }
+      visitor.visit(ast)
+      return if visitor.validations.empty?
+
+      @ast_nodes << { file: file, validations: visitor.validations, type: :validations }
     end
 
     def extract_associations(file, ast)
-      associations = []
-      ast.each_node(:send) do |node|
-        assoc_methods = [:belongs_to, :has_many, :has_one, :has_and_belongs_to_many,
-                        :has_many_through, :has_one_through]
-        if assoc_methods.include?(node.method_name)
-          associations << node.method_name
-        end
-      end
-      return if associations.empty?
+      visitor = Class.new(Prism::Visitor) do
+        attr_reader :associations
 
-      @ast_nodes << { file: file, associations: associations, type: :associations }
+        def initialize
+          @associations = []
+          @targets = [:belongs_to, :has_many, :has_one, :has_and_belongs_to_many,
+                      :has_many_through, :has_one_through]
+        end
+
+        def visit_call_node(node)
+          @associations << node.name if @targets.include?(node.name)
+          super
+        end
+      end.new
+
+      visitor.visit(ast)
+      return if visitor.associations.empty?
+
+      @ast_nodes << { file: file, associations: visitor.associations, type: :associations }
     end
 
     def extract_custom_methods(file, ast)
-      methods = []
-      ast.each_node(:def) do |node|
-        next if [:initialize, :to_json, :to_yaml, :inspect, :class, :new, :attr_accessor,
-                :attr_reader, :attr_writer, :attr, :attr_readonly].include?(node.method_name)
-        methods << node.method_name
-      end
-      return if methods.empty?
+      visitor = Class.new(Prism::Visitor) do
+        attr_reader :methods
 
-      @ast_nodes << { file: file, methods: methods, type: :custom_methods }
+        def initialize
+          @methods = []
+          @ignored = [:initialize, :to_json, :to_yaml, :inspect, :class, :new, :attr_accessor,
+                      :attr_reader, :attr_writer, :attr, :attr_readonly]
+        end
+
+        def visit_def_node(node)
+          @methods << node.name unless @ignored.include?(node.name)
+          super
+        end
+      end.new
+
+      visitor.visit(ast)
+      return if visitor.methods.empty?
+
+      @ast_nodes << { file: file, methods: visitor.methods, type: :custom_methods }
     end
 
     def extract_factories(file, content)
@@ -181,15 +263,23 @@ module Conjureshield
     end
 
     def extract_delegation(file, ast)
-      delegations = []
-      ast.each_node(:send) do |node|
-        if node.method_name == :delegate
-          delegations << node.method_name
-        end
-      end
-      return if delegations.empty?
+      visitor = Class.new(Prism::Visitor) do
+        attr_reader :delegations
 
-      @ast_nodes << { file: file, delegations: delegations, type: :delegation }
+        def initialize
+          @delegations = []
+        end
+
+        def visit_call_node(node)
+          @delegations << node.name if node.name == :delegate
+          super
+        end
+      end.new
+
+      visitor.visit(ast)
+      return if visitor.delegations.empty?
+
+      @ast_nodes << { file: file, delegations: visitor.delegations, type: :delegation }
     end
 
     def extract_stimulus(file, content)
@@ -227,47 +317,54 @@ module Conjureshield
     end
 
     def detect_missing_tests
-      controller = @ast_nodes.find { |n| n[:type] == :controller }
-      model = @ast_nodes.find { |n| n[:type] == :model }
+      models = @ast_nodes.select { |n| n[:type] == :model }
+      controllers = @ast_nodes.select { |n| n[:type] == :controller }
 
-      return unless controller && model
+      # 1. Evaluate missing Model tests
+      models.each do |model_node|
+        expected_spec = "#{File.basename(model_node[:file], '.rb')}_spec.rb"
+        has_test = @existing_tests.any? { |t| t[:filename] == expected_spec }
 
-      @missing_tests << {
-        type: :integration,
-        controller: controller[:controller],
-        model: model[:model],
-        suggestions: [
-          { name: "user workflow: create and view", type: :create_view },
-          { name: "user workflow: edit and update", type: :edit_update },
-          { name: "user workflow: delete", type: :delete },
-          { name: "view details", type: :view_details }
-        ]
-      }
+        unless has_test
+          # Formatted as Hashes so suggestion[:name] works in your CLI
+          suggestions = [
+            { name: "Verify model initialization structure", type: :init }
+          ]
+          
+          if model_node.dig(:metadata, :validations)&.any?
+            suggestions << { name: "Test active validations", type: :validations }
+          end
+          
+          if model_node.dig(:metadata, :associations)&.any?
+            suggestions << { name: "Test active associations", type: :associations }
+          end
 
-      @missing_tests << {
-        type: :api,
-        controller: controller[:controller],
-        model: model[:model],
-        suggestions: [
-          { name: "GET list", type: :get_list },
-          { name: "GET single", type: :get_single },
-          { name: "POST create", type: :post_create },
-          { name: "PUT update", type: :put_update },
-          { name: "DELETE destroy", type: :delete_destroy }
-        ]
-      }
+          @missing_tests << {
+            type: :unit,
+            model: model_node[:model],
+            file: model_node[:file],
+            suggestions: suggestions
+          }
+        end
+      end
 
-      @missing_tests << {
-        type: :feature,
-        controller: controller[:controller],
-        model: model[:model],
-        suggestions: [
-          { name: "user story: create and view", type: :create_view_feature },
-          { name: "user story: edit", type: :edit_feature },
-          { name: "user story: delete", type: :delete_feature },
-          { name: "user story: view details", type: :view_details_feature }
-        ]
-      }
+      # 2. Evaluate missing Controller tests
+      controllers.each do |controller_node|
+        expected_spec = "#{File.basename(controller_node[:file], '.rb')}_spec.rb"
+        has_test = @existing_tests.any? { |t| t[:filename] == expected_spec }
+
+        unless has_test
+          @missing_tests << {
+            type: :request,
+            controller: controller_node[:controller],
+            file: controller_node[:file],
+            suggestions: [
+              { name: "Test standard GET #index response parameters", type: :get_index },
+              { name: "Test POST #create branch handling", type: :post_create }
+            ]
+          }
+        end
+      end
     end
   end
 end

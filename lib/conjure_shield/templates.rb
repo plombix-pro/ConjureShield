@@ -1,9 +1,13 @@
 module Conjureshield
   class Templates
+    # 1. Define this as a proper constant at the top
+    EXAMPLES_PATH = "/tmp/rspec-examples"
+
     attr_reader :examples
 
     def initialize
-      @examples = load_rspec_examples
+      # 2. Call the class method explicitly using self.class
+      @examples = self.class.load_rspec_examples
     end
 
     def self.load
@@ -27,10 +31,6 @@ module Conjureshield
       Dir.glob("#{file}/**/*.rb").each do |subfile|
         parse_file(subfile, examples)
       end
-    end
-
-    def self.EXAMPLES_PATH
-      "/tmp/rspec-examples"
     end
 
     def self.get_template(type, context = {})

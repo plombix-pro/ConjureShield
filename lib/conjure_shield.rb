@@ -7,7 +7,7 @@ require "conjure_shield/templates"
 module Conjureshield
   class << self
     def analyze(path)
-      RailsSuggester.new(path).analyze
+      Conjureshield::Analyzer.new(path).analyze
     end
 
     def generate_tests(code, suggestions)

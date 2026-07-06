@@ -1,24 +1,39 @@
+require 'fileutils'
 namespace :conjureshield do
   desc "Validate Rails project setup for ConjureShield"
   task :validate do
-    codebase = ENV.fetch("CODEBASE_PATH") { Dir.pwd }
-    codebase = File.expand_path(codebase)
-
-    checks = {
-      "config/application.rb" => File.exist?(File.join(codebase, "config", "application.rb")),
-      "Gemfile" => File.exist?(File.join(codebase, "Gemfile")),
-      "Gemfile.lock" => File.exist?(File.join(codebase, "Gemfile.lock")),
-      "spec/" => Dir.exist?(File.join(codebase, "spec")),
-      "config/database.yml" => File.exist?(File.join(codebase, "config", "database.yml"))
-    }
-
+    codebase = File.expand_path(ENV.fetch("CODEBASE_PATH") { Dir.pwd })
     all_passed = true
-    checks.each do |name, passed|
-      status = passed ? "✅" : "❌"
-      puts "#{status} #{name}"
-      all_passed = false unless passed
+  
+    # 1. Verify if it is a Rails app by checking for bin/rails
+    rails_bin = File.join(codebase, "bin", "rails")
+    if File.exist?(rails_bin) && File.executable?(rails_bin)
+      puts "✅ Rails project detected"
+    else
+      puts "❌ Not a valid Rails project (bin/rails not found or not executable)"
+      all_passed = false
     end
-
+  
+    # 2. Check for database.yml (Optional but recommended)
+    db_config = File.join(codebase, "config", "database.yml")
+    if File.exist?(db_config)
+      puts "✅ config/database.yml"
+    else
+      puts "❌ config/database.yml missing"
+      all_passed = false
+    end
+  
+    # 3. Handle 'spec/' directory with auto-creation
+    spec_path = File.join(codebase, "spec")
+    if Dir.exist?(spec_path)
+      puts "✅ spec/"
+    else
+      puts "⚠️  spec/ directory missing. Creating it for you..."
+      FileUtils.mkdir_p(spec_path)
+      puts "✅ spec/ (created successfully)"
+    end
+  
+    # 4. Final status
     if all_passed
       puts "\n✅ Rails project is ready for ConjureShield!"
     else
