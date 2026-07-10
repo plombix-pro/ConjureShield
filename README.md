@@ -1,7 +1,7 @@
 # Conjure Shield
-Bored of create the folders and files needed to test your app ? 
-Get you 100% code coverage quicker !
-Conjure a Shield for your app : 
+Bored of create the folders and files needed to test your app ?  
+Get you 100% code coverage quicker !  
+Conjure a Shield for your app :  
 
 Auto Rails test suggestion and implementation generator. Supports both **RSpec** and **Minitest**.
 
