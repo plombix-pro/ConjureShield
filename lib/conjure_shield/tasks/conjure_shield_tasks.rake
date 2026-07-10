@@ -52,7 +52,7 @@ namespace :conjureshield do
     puts "📁 Analyzing: #{codebase}"
     puts "=" * 50
 
-    analyzer = Conjureshield.analyze(codebase)
+    analyzer = ConjureShield.analyze(codebase)
 
     puts "\n📊 Analysis Results:"
     puts "-" * 50
@@ -86,18 +86,24 @@ namespace :conjureshield do
       Rails::Generators.invoke("conjure_shield:install", [], destination_root: codebase)
     end
 
-    puts "\n🎯 Generating test implementations..."
+    puts "\n🎯 Generating example test files..."
     puts "=" * 50
 
-    analyzer = Conjureshield.analyze(codebase)
+    analyzer = ConjureShield.analyze(codebase)
 
     if analyzer.missing_tests.any?
-      puts "📝 Generating #{analyzer.missing_tests.count} test file(s)..."
-      Conjureshield.generate_tests(analyzer.files, analyzer.missing_tests)
-      puts "\n✅ Tests generated! Check spec/ directory."
+      puts "📝 Generating #{analyzer.missing_tests.count} example file(s)..."
+      ConjureShield::TestGenerator.generate_for_all_frameworks(analyzer.files, analyzer.missing_tests, codebase)
+
+      generated_dirs = []
+      generated_dirs << "spec/" if Dir.exist?(File.join(codebase, "spec"))
+      generated_dirs << "test/" if Dir.exist?(File.join(codebase, "test"))
+      puts "\n✅ Example files generated in #{generated_dirs.join(" and ")}. All content is commented out."
       puts ""
-      puts "⚠️  WARNING: THESE ARE GENERIC TEMPLATES. YOU MUST HEAVILY ADAPT"
-      puts "⚠️  EACH TEST TO MATCH YOUR ACTUAL APPLICATION CODE AND LOGIC."
+      puts "⚠️  These are skeleton examples only. To use them:"
+      puts "⚠️  1. Open each generated file in #{generated_dirs.first} or #{generated_dirs.last}"
+      puts "⚠️  2. Uncomment the relevant portions"
+      puts "⚠️  3. Adapt assertions to match your actual application logic"
       puts ""
     else
       puts "⚠️  No missing tests detected. All features appear to be covered."
@@ -108,7 +114,7 @@ namespace :conjureshield do
   task :check_tests do
     codebase = ENV.fetch("CODEBASE_PATH") { Dir.pwd }
     codebase = File.expand_path(codebase)
-    analyzer = Conjureshield.analyze(codebase)
+    analyzer = ConjureShield.analyze(codebase)
 
     puts "🔍 ConjureShield - Test Setup Check"
     puts "=" * 50

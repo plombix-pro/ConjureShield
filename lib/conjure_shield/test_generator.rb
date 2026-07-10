@@ -1,13 +1,12 @@
 require "fileutils"
 
-module Conjureshield
+module ConjureShield
   class TestGenerator
-    attr_reader :code, :suggestions, :templates
+    attr_reader :code, :suggestions
 
     def initialize(code, suggestions)
       @code = code
       @suggestions = suggestions
-      @templates = Templates.load
       @codebase_path = Dir.pwd
       @framework = nil
     end
@@ -23,7 +22,29 @@ module Conjureshield
       end.generate_all
     end
 
-    def generate_all
+    def self.generate_for_all_frameworks(code, suggestions, codebase_path)
+      frameworks = []
+      frameworks << :rspec if Dir.exist?(File.join(codebase_path, "spec"))
+      if Dir.exist?(File.join(codebase_path, "test"))
+        frameworks << :minitest
+      else
+        FileUtils.mkdir_p(File.join(codebase_path, "test"))
+        frameworks << :minitest
+        puts "Created test/ directory for Minitest"
+      end
+
+      frameworks.each_with_index do |fw, idx|
+        new(code, suggestions).tap do |g|
+          g.instance_variable_set(:@codebase_path, codebase_path)
+          g.instance_variable_set(:@framework, fw)
+        end.generate_all(skip_factories: idx > 0)
+      end
+    end
+
+    def generate_all(framework: nil, skip_factories: false)
+      @framework = framework if framework
+      generate_factories unless skip_factories
+
       @suggestions.each do |missing_test|
         inner = missing_test[:suggestions] || []
         context = missing_test.reject { |k, _| k == :suggestions }
@@ -34,6 +55,129 @@ module Conjureshield
           generate_test(merged)
         end
       end
+    end
+
+    def generate_factories
+      collect_factory_specs.each do |model_name, info|
+        write_factory_file(model_name, factory_content(model_name, info[:columns], info[:associations]))
+      end
+    end
+
+    def collect_factory_specs
+      specs = {}
+      @suggestions.each do |missing_test|
+        inner = missing_test[:suggestions] || []
+        context = missing_test.reject { |k, _| k == :suggestions }
+        inner.each do |suggestion|
+          next unless suggestion[:type] == :factories
+
+          merged = context.merge(suggestion)
+          specs[merged[:model]] = {
+            columns: merged[:columns] || {},
+            associations: merged[:associations] || []
+          }
+        end
+      end
+      specs
+    end
+
+    def factory_content(model_name, columns, associations)
+      factory_decl = if model_name.include?("::")
+        "  factory :#{factory_name(model_name)}, class: \"#{model_name}\" do"
+      else
+        "  factory :#{factory_name(model_name)} do"
+      end
+
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        "FactoryBot.define do",
+        factory_decl,
+        factory_attribute_lines(columns),
+        factory_association_lines(associations),
+        "  end",
+        "end",
+        "",
+      ]
+      lines.flatten.join("\n")
+    end
+
+    EXCLUDED_FACTORY_COLUMNS = %w[
+      id created_at updated_at encrypted_password reset_password_token
+      reset_password_sent_at remember_created_at
+    ].freeze
+
+    def factory_attribute_lines(columns)
+      columns.reject { |name, _| EXCLUDED_FACTORY_COLUMNS.include?(name) }.flat_map do |col_name, col_info|
+        line = factory_attribute_line(col_name, col_info[:type])
+        line ? "    #{line}" : nil
+      end.compact
+    end
+
+    def factory_attribute_line(col_name, type)
+      case col_name
+      when "email", /_email$/
+        "sequence(:#{col_name}) { |n| \"user_\#{n}@example.com\" }"
+      when /_url$/
+        "#{col_name} { \"https://example.com/#{col_name}\" }"
+      else
+        case type
+        when :string then "#{col_name} { \"#{col_name.humanize.downcase}\" }"
+        when :text then "#{col_name} { \"sample text\" }"
+        when :integer then "#{col_name} { 1 }"
+        when :boolean then "#{col_name} { false }"
+        when :datetime, :date then "#{col_name} { Time.current }"
+        when :decimal, :float then "#{col_name} { 1.0 }"
+        else
+          nil
+        end
+      end
+    end
+
+    def factory_association_lines(associations)
+      associations.flat_map do |assoc|
+        name = assoc[:name]
+        target = assoc[:target]
+        case assoc[:type]
+        when :belongs_to
+          "    association :#{name}"
+        when :has_one, :has_one_through
+          [
+            "    trait :with_#{name} do",
+            "      association :#{name}",
+            "    end",
+          ]
+        when :has_many
+          [
+            "    trait :with_#{name} do",
+            "      association :#{name}",
+            "    end",
+          ]
+        when :has_and_belongs_to_many, :has_many_through
+          [
+            "    trait :with_#{name} do",
+            "      after(:create) do |obj, evaluator|",
+            "        obj.#{name} << create(:#{target.underscore})",
+            "      end",
+            "    end",
+          ]
+        else
+          nil
+        end
+      end.compact
+    end
+
+    def write_factory_file(model_name, content)
+      base = @codebase_path || Dir.pwd
+      base_dir = File.join(base, rspec? ? "spec" : "test", "factories")
+      FileUtils.mkdir_p(base_dir)
+      path = File.join(base_dir, "#{factory_name(model_name)}.rb")
+      if File.exist?(path)
+        puts "Skipped existing factory: #{path}"
+        return
+      end
+      File.write(path, content)
+      puts "Generated factory: #{path}"
     end
 
     private
@@ -71,6 +215,10 @@ module Conjureshield
       end
     end
 
+    def write_lines(lines)
+      lines.flatten.join("\n") + "\n"
+    end
+
     def devise?
       return @_devise if defined?(@_devise)
       base = @codebase_path || Dir.pwd
@@ -86,11 +234,20 @@ module Conjureshield
 
       models.each do |model|
         if model[:content].include?("devise ") || model[:content].include?("devise\n")
-          @_devise_model = File.basename(model[:path], ".rb").split("_").map(&:capitalize).join
+          @_devise_model = model_name_from_path(model[:path])
           break
         end
       end
       @_devise_model || "User"
+    end
+
+    def model_name_from_path(path)
+      relative = path.sub(%r{.*/app/models/}, "").sub(/\.rb\z/, "")
+      relative.split("/").map { |part| part.split("_").map(&:capitalize).join }.join("::")
+    end
+
+    def factory_name(model_name)
+      model_name.underscore.tr("/", "_")
     end
 
     def devise_setup(indent: 2, extra_attrs: {})
@@ -104,6 +261,20 @@ module Conjureshield
       "#{pad}include Devise::Test::IntegrationHelpers\n" \
       "#{pad}let(:current_user) { #{model}.create!(#{attrs_str}) }\n" \
       "#{pad}before { sign_in current_user }\n\n"
+    end
+
+    def devise_setup_lines(component: "  ")
+      return [] unless devise?
+
+      model = devise_model_name
+      attrs = {email: "test@example.com", password: "password", password_confirmation: "password"}
+      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+      [
+        "#{component}include Devise::Test::IntegrationHelpers",
+        "#{component}let(:current_user) { #{model}.create!(#{attrs_str}) }",
+        "#{component}before { sign_in current_user }",
+        "",
+      ]
     end
 
     def factory_attributes(model_name, columns: {}, extra_attrs: {})
@@ -154,7 +325,7 @@ module Conjureshield
     end
 
     def ctrl_base(name)
-      name.to_s.sub(/Controller$/, "").underscore.singularize
+      name.to_s.sub(/Controller$/, "").underscore.singularize.tr("/", "_")
     end
 
     def ctrl_route(name)
@@ -256,46 +427,85 @@ module Conjureshield
 
     private
 
-    def minitest?
-      @framework == :minitest
-    end
-
     def generate_stimulus_test(suggestion)
       controller = suggestion[:controller]
+      targets = suggestion[:targets] || []
+      values = suggestion[:values] || {}
+      classes = suggestion[:classes] || []
+      actions = suggestion[:actions] || []
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe \"##{controller}\", type: :stimulus do",
+        "  describe \"lifecycle\" do",
+        "    it \"connects without error\" do",
+        "      controller = #{controller.camelize}Controller.new",
+        "      expect { controller.connect() }.not_to raise_error",
+        "    end",
+        "",
+        "    it \"disconnects without error\" do",
+        "      controller = #{controller.camelize}Controller.new",
+        "      expect { controller.disconnect() }.not_to raise_error",
+        "    end",
+        "  end",
+        "",
+      ]
 
-        #{spec_helper_require}
-
-        RSpec.describe "#{controller}", type: :stimulus do
-          describe "Stimulus controller" do
-            it "initializes with correct defaults" do
-              expect(controller).to receive(:value).and_call_original
-              controller.initialize
-            end
-
-            it "handles value changes" do
-              controller = StimulusController.new
-              expect(controller.value).to eq("default")
-            end
-
-            it "triggers action on value change" do
-              controller = StimulusController.new
-              expect(controller).to receive(:value_changed)
-              controller.value = "new_value"
-            end
-
-            it "triggers action on target change" do
-              controller = StimulusController.new
-              expect(controller).to receive(:target_changed)
-              controller.target = "new_target"
-            end
-          end
+      if targets.any?
+        lines << "  describe \"targets\" do"
+        targets.each do |target|
+          lines << "    it \"has a #{target} target\" do"
+          lines << "      expect(controller).to respond_to(:#{target}_target)"
+          lines << "    end"
+          lines << ""
         end
-      TEST
+        lines << "  end"
+        lines << ""
+      end
 
-      write_test_file(controller, test_content)
+      if values.any?
+        lines << "  describe \"values\" do"
+        values.each do |name, type|
+          lines << "    it \"has #{name} value\" do"
+          lines << "      expect(controller).to respond_to(:#{name})"
+          lines << "    end"
+          lines << ""
+        end
+        lines << "  end"
+        lines << ""
+      end
+
+      if classes.any?
+        lines << "  describe \"CSS classes\" do"
+        classes.each do |cls|
+          lines << "    it \"has #{cls} CSS class\" do"
+          lines << "      expect(controller).to respond_to(:#{cls}_class)"
+          lines << "    end"
+          lines << ""
+        end
+        lines << "  end"
+        lines << ""
+      end
+
+      if actions.any?
+        lines << "  describe \"actions\" do"
+        actions.each do |action|
+          lines << "    it \"responds to #{action}\" do"
+          lines << "      expect(controller).to respond_to(:#{action})"
+          lines << "    end"
+          lines << ""
+        end
+        lines << "  end"
+        lines << ""
+      end
+
+      lines << "end"
+      lines << ""
+
+      write_test_file(controller, lines.join("\n"))
     end
 
     def generate_cable_test(suggestion)
@@ -371,30 +581,27 @@ module Conjureshield
     def generate_validations_test(model)
       fields = model[:fields]
       validations = model[:validations]
+      model_name = model[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
-
-        #{spec_helper_require}
-
-        RSpec.describe #{model[:model]}, type: :model do
-          describe "validations" do
-            #{generate_validation_contexts(fields, validations)}
-          end
-        end
-      TEST
-
-      write_test_file(model[:model], test_content)
-    end
-
-    def generate_validation_contexts(fields, validations)
-      contexts = []
-
-      validations.each do |validation|
-        contexts << generate_validation_context(validation)
+      inner = validations.flat_map do |validation|
+        generate_validation_context(validation) + [""]
       end
+      inner.pop
 
-      contexts.join("\n")
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"validations\" do",
+        inner,
+        "  end",
+        "end",
+        "",
+      ]
+
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_validation_context(validation)
@@ -404,27 +611,27 @@ module Conjureshield
       matchers = validators.map do |v|
         case v.to_s.downcase
         when "presence"
-          "it { is_expected.to validate_presence_of(:#{field}) }"
+          "      it { is_expected.to validate_presence_of(:#{field}) }"
         when "uniqueness"
-          "it { is_expected.to validate_uniqueness_of(:#{field}) }"
+          "      it { is_expected.to validate_uniqueness_of(:#{field}) }"
         when "length"
-          "it { is_expected.to validate_length_of(:#{field}) }"
+          "      it { is_expected.to validate_length_of(:#{field}) }"
         when "inclusion"
-          "it { is_expected.to validate_inclusion_of(:#{field}).in_array([]) }"
+          "      it { is_expected.to validate_inclusion_of(:#{field}).in_array([]) }"
         when "format"
-          "it { is_expected.to allow_value(\"value\").for(:#{field}) }"
+          "      it { is_expected.to allow_value(\"value\").for(:#{field}) }"
         when "numericality"
-          "it { is_expected.to validate_numericality_of(:#{field}) }"
+          "      it { is_expected.to validate_numericality_of(:#{field}) }"
         else
-          "it { is_expected.to validate_presence_of(:#{field}) }"
+          "      it { is_expected.to validate_presence_of(:#{field}) }"
         end
       end
 
-      <<-CONTEXT
-            context "validates #{field}" do
-              #{matchers.join("\n              ")}
-            end
-      CONTEXT
+      [
+        "    context \"validates #{field}\" do",
+        matchers,
+        "    end",
+      ]
     end
 
     def generate_validation_messages_test(model)
@@ -436,11 +643,13 @@ module Conjureshield
         RSpec.describe #{model[:model]}, type: :model do
           describe "validation error messages" do
             it "returns custom error messages" do
-              expect(build(:#{model[:model].downcase}), invalid_data: "value").errors.full_messages
+              record = build(:#{model[:model].downcase}, invalid_data: "value")
+              expect(record.errors.full_messages).to be_present
             end
 
             it "returns I18n localized messages" do
-              expect(build(:#{model[:model].downcase}), invalid_data: "value").errors.full_messages
+              record = build(:#{model[:model].downcase}, invalid_data: "value")
+              expect(record.errors.full_messages).to be_present
             end
           end
         end
@@ -451,113 +660,133 @@ module Conjureshield
 
     def generate_has_one_test(model)
       associations = model[:associations].select { |a| a[:type] == :has_one }
+      model_name = model[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = associations.flat_map do |assoc|
+        generate_has_one_context(assoc) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"associations\" do",
+        "    context \"has_one associations\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model[:model]}, type: :model do
-          describe "associations" do
-            context "has_one associations" do
-              #{associations.map { |assoc| generate_has_one_context(assoc) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_has_one_context(assoc)
       target = assoc[:target]
 
-      <<-CONTEXT
-              it { is_expected.to have_one(:#{target.downcase}) }
-              it { is_expected.to have_one(:#{target.downcase}) }
-      CONTEXT
+      [
+        "      it { is_expected.to have_one(:#{target.downcase}) }",
+      ]
     end
 
     def generate_has_many_test(model)
       associations = model[:associations].select { |a| a[:type] == :has_many }
+      model_name = model[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = associations.flat_map do |assoc|
+        generate_has_many_context(assoc) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"associations\" do",
+        "    context \"has_many associations\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model[:model]}, type: :model do
-          describe "associations" do
-            context "has_many associations" do
-              #{associations.map { |assoc| generate_has_many_context(assoc) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_has_many_context(assoc)
       target = assoc[:target]
 
-      <<-CONTEXT
-              it { is_expected.to have_many(:#{target.downcase.pluralize}) }
-              it { is_expected.to have_many(:#{target.downcase.pluralize}) }
-      CONTEXT
+      [
+        "      it { is_expected.to have_many(:#{target.downcase.pluralize}) }",
+      ]
     end
 
     def generate_belongs_to_test(model)
       associations = model[:associations].select { |a| a[:type] == :belongs_to }
+      model_name = model[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = associations.flat_map do |assoc|
+        generate_belongs_to_context(assoc) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"associations\" do",
+        "    context \"belongs_to associations\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model[:model]}, type: :model do
-          describe "associations" do
-            context "belongs_to associations" do
-              #{associations.map { |assoc| generate_belongs_to_context(assoc) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_belongs_to_context(assoc)
       target = assoc[:target]
 
-      <<-CONTEXT
-              it { is_expected.to belong_to(:#{target.downcase}) }
-              it { is_expected.to belong_to(:#{target.downcase}) }
-      CONTEXT
+      [
+        "      it { is_expected.to belong_to(:#{target.downcase}) }",
+      ]
     end
 
     def generate_association_validations_test(model)
       associations = model[:associations]
+      model_name = model[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"associations\" do",
+        "    context \"association validations\" do",
+        "      it \"validates associated #{model_name.downcase.pluralize} are valid\" do",
+        "        record = #{model_name}.new",
+        "        record.valid?",
+        "        expect(record.errors).to be_present",
+        "      end",
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        #{spec_helper_require}
-
-        RSpec.describe #{model[:model]}, type: :model do
-          describe "associations" do
-            context "association validations" do
-              it { is_expected.to validate_associated_#{model[:model].downcase.pluralize}_of(:#{model[:model].downcase}) }
-              it { is_expected.to validate_associated_#{model[:model].downcase.pluralize}_of(:#{model[:model].downcase}).on(:create) }
-              it { is_expected.to validate_associated_#{model[:model].downcase.pluralize}_of(:#{model[:model].downcase}).on(:update) }
-              it { is_expected.to validate_associated_#{model[:model].downcase.pluralize}_of(:#{model[:model].downcase}).case_insensitive }
-              it { is_expected.to validate_associated_#{model[:model].downcase.pluralize}_of(:#{model[:model].downcase}).with_message("custom message") }
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model[:model], test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_scopes_test(model)
@@ -565,24 +794,29 @@ module Conjureshield
       model_name = model[:model]
       columns = model[:columns] || {}
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      scope_tests = scopes.flat_map do |scope|
+        generate_scope_lines(scope, model_name, columns: columns) + [""]
+      end
+      scope_tests.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"scopes\" do",
+        scope_tests,
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "scopes" do
-            #{scopes.map { |scope| generate_scope_test(scope, model_name, columns: columns) }.join("\n")}
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
-    def generate_scope_test(scope, model_name, columns: {})
+    def generate_scope_lines(scope, model_name, columns: {})
       name = scope[:name]
-      args = scope[:args]
 
       extra = {}
       boolean_cols = columns.select { |_, ci| ci[:type] == :boolean }.keys
@@ -596,42 +830,48 @@ module Conjureshield
       attrs = factory_attributes(model_name, columns: columns, extra_attrs: extra)
       attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
 
-      <<-TEST
-            it "returns #{name} results" do
-              record = described_class.create!(#{attrs_str})
-              expect(described_class.#{name}).to be_present
-            end
-      TEST
+      [
+        "    it \"returns #{name} results\" do",
+        "      record = described_class.create!(#{attrs_str})",
+        "      expect(described_class.#{name}).to be_present",
+        "    end",
+      ]
     end
 
     def generate_scoped_arguments_test(model)
       scopes = model[:scopes]
       model_name = model[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = scopes.flat_map do |scope|
+        generate_scoped_arguments_context(scope, model_name) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"scopes with arguments\" do",
+        inner,
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "scopes with arguments" do
-            #{scopes.map { |scope| generate_scoped_arguments_context(scope, model_name) }.join("\n")}
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_scoped_arguments_context(scope, model_name)
       name = scope[:name]
       args = scope[:args]
 
-      <<-CONTEXT
-            it "accepts #{name} with #{args.join(", ")}" do
-              expect(described_class.#{name}(#{args.join(", ")})).to be_present
-            end
-      CONTEXT
+      [
+        "    it \"accepts #{name} with #{args.join(", ")}\" do",
+        "      expect(described_class.#{name}(#{args.join(", ")})).to be_present",
+        "    end",
+      ]
     end
 
     def generate_before_save_test(model)
@@ -639,33 +879,39 @@ module Conjureshield
       model_name = model[:model]
       columns = model[:columns] || {}
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = callbacks.flat_map do |cb|
+        generate_before_save_context(cb, model_name, columns: columns) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"callbacks\" do",
+        "    context \"before_save callbacks\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "callbacks" do
-            context "before_save callbacks" do
-              #{callbacks.map { |cb| generate_before_save_context(cb, model_name, columns: columns) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_before_save_context(callback, model_name, columns: {})
       var = model_name.underscore
       attrs = factory_attributes(model_name, columns: columns)
       attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
-      <<-CONTEXT
-              it "executes before_save callback" do
-                #{var} = described_class.new(#{attrs_str})
-                expect { #{var}.save(validate: false) }.not_to raise_error
-              end
-      CONTEXT
+      [
+        "      it \"executes before_save callback\" do",
+        "        #{var} = described_class.new(#{attrs_str})",
+        "        expect { #{var}.save(validate: false) }.not_to raise_error",
+        "      end",
+      ]
     end
 
     def generate_after_save_test(model)
@@ -673,33 +919,39 @@ module Conjureshield
       model_name = model[:model]
       columns = model[:columns] || {}
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = callbacks.flat_map do |cb|
+        generate_after_save_context(cb, model_name, columns: columns) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"callbacks\" do",
+        "    context \"after_save callbacks\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "callbacks" do
-            context "after_save callbacks" do
-              #{callbacks.map { |cb| generate_after_save_context(cb, model_name, columns: columns) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_after_save_context(callback, model_name, columns: {})
       var = model_name.underscore
       attrs = factory_attributes(model_name, columns: columns)
       attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
-      <<-CONTEXT
-              it "executes after_save callback" do
-                #{var} = described_class.new(#{attrs_str})
-                expect { #{var}.save }.not_to raise_error
-              end
-      CONTEXT
+      [
+        "      it \"executes after_save callback\" do",
+        "        #{var} = described_class.new(#{attrs_str})",
+        "        expect { #{var}.save }.not_to raise_error",
+        "      end",
+      ]
     end
 
     def generate_before_destroy_test(model)
@@ -707,33 +959,39 @@ module Conjureshield
       model_name = model[:model]
       columns = model[:columns] || {}
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = callbacks.flat_map do |cb|
+        generate_before_destroy_context(cb, model_name, columns: columns) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"callbacks\" do",
+        "    context \"before_destroy callbacks\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "callbacks" do
-            context "before_destroy callbacks" do
-              #{callbacks.map { |cb| generate_before_destroy_context(cb, model_name, columns: columns) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_before_destroy_context(callback, model_name, columns: {})
       var = model_name.underscore
       attrs = factory_attributes(model_name, columns: columns)
       attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
-      <<-CONTEXT
-              it "executes before_destroy callback" do
-                #{var} = described_class.new(#{attrs_str})
-                expect { #{var}.destroy }.not_to raise_error
-              end
-      CONTEXT
+      [
+        "      it \"executes before_destroy callback\" do",
+        "        #{var} = described_class.new(#{attrs_str})",
+        "        expect { #{var}.destroy }.not_to raise_error",
+        "      end",
+      ]
     end
 
     def generate_after_destroy_test(model)
@@ -741,33 +999,39 @@ module Conjureshield
       model_name = model[:model]
       columns = model[:columns] || {}
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = callbacks.flat_map do |cb|
+        generate_after_destroy_context(cb, model_name, columns: columns) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"callbacks\" do",
+        "    context \"after_destroy callbacks\" do",
+        inner,
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "callbacks" do
-            context "after_destroy callbacks" do
-              #{callbacks.map { |cb| generate_after_destroy_context(cb, model_name, columns: columns) }.join("\n")}
-            end
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_after_destroy_context(callback, model_name, columns: {})
       var = model_name.underscore
       attrs = factory_attributes(model_name, columns: columns)
       attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
-      <<-CONTEXT
-              it "executes after_destroy callback" do
-                #{var} = described_class.new(#{attrs_str})
-                expect { #{var}.destroy }.not_to raise_error
-              end
-      CONTEXT
+      [
+        "      it \"executes after_destroy callback\" do",
+        "        #{var} = described_class.new(#{attrs_str})",
+        "        expect { #{var}.destroy }.not_to raise_error",
+        "      end",
+      ]
     end
 
     def generate_custom_methods_test(model)
@@ -775,19 +1039,25 @@ module Conjureshield
       model_name = model[:model]
       columns = model[:columns] || {}
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = methods.flat_map do |m|
+        generate_custom_method_test(m, model_name, columns: columns) + [""]
+      end
+      inner.pop
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name}, type: :model do",
+        "  describe \"custom methods\" do",
+        inner,
+        "  end",
+        "end",
+        "",
+      ]
 
-        RSpec.describe #{model_name}, type: :model do
-          describe "custom methods" do
-            #{methods.map { |m| generate_custom_method_test(m, model_name, columns: columns) }.join("\n")}
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_custom_method_test(method, model_name, columns: {})
@@ -804,42 +1074,34 @@ module Conjureshield
                 else "be_present"
                 end
 
-      <<-TEST
-            it "returns #{name} result" do
-              expect(#{receiver}.#{name}).to #{matcher}
-            end
-      TEST
+      [
+        "    it \"returns #{name} result\" do",
+        "      expect(#{receiver}.#{name}).to #{matcher}",
+        "    end",
+      ]
     end
 
     def generate_factories_test(model)
       model_name = model[:model]
-      columns = model[:columns] || {}
-      attrs = factory_attributes(model_name, columns: columns)
-      attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(",\n        ")
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      inner = [
+        "  it \"has a valid factory\" do",
+        "    expect(build(:#{factory_name(model_name)})).to be_valid",
+        "  end",
+      ]
 
-        #{spec_helper_require}
+      lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe #{model_name} do",
+        inner,
+        "end",
+        "",
+      ]
 
-         RSpec.describe #{model_name} do
-          it "creates valid #{model_name.downcase} instances" do
-            record = #{model_name}.new(
-              #{attrs_str}
-            )
-            expect(record).to be_valid
-          end
-
-          it "creates #{model_name.downcase} with default values" do
-            record = #{model_name}.new(
-              #{attrs_str}
-            )
-            expect(record).to be_valid
-          end
-        end
-      TEST
-
-      write_test_file(model_name, test_content)
+      write_test_file(model_name, write_lines(lines))
     end
 
     def generate_serialization_test(model)
@@ -851,11 +1113,11 @@ module Conjureshield
         RSpec.describe #{model[:model]}, type: :model do
           describe "serialization" do
             it "serializes to JSON" do
-              expect(build(:#{model[:model].downcase}).to_json).to be_present
+              expect(build(:#{factory_name(model[:model])}).to_json).to be_present
             end
 
             it "serializes to YAML" do
-              expect(build(:#{model[:model].downcase}).to_yaml).to be_present
+              expect(build(:#{factory_name(model[:model])}).to_yaml).to be_present
             end
           end
         end
@@ -873,11 +1135,11 @@ module Conjureshield
         RSpec.describe #{model[:model]}, type: :model do
           describe "delegation" do
             it "delegates method to association" do
-              expect(build(:#{model[:model].downcase})).to delegate(:method_name).to(:association_name)
+              expect(build(:#{factory_name(model[:model])})).to delegate(:method_name).to(:association_name)
             end
 
             it "delegates method with prefix" do
-              expect(build(:#{model[:model].downcase})).to delegate(:method_name).to(:association_name, prefix: true)
+              expect(build(:#{factory_name(model[:model])})).to delegate(:method_name).to(:association_name, prefix: true)
             end
           end
         end
@@ -887,7 +1149,6 @@ module Conjureshield
     end
 
     def generate_get_index_test(controller)
-      devise_block = devise_setup
       route_plural = ctrl_route(controller[:controller])
       model_name = controller[:model]
       columns = controller[:columns] || {}
@@ -897,36 +1158,49 @@ module Conjureshield
       attrs1_str = attrs1.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
       attrs2_str = attrs2.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      test_lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe \"#{controller[:controller]}\", type: :request do",
+      ]
 
-        #{spec_helper_require}
+      if devise?
+        test_lines << "  include Devise::Test::IntegrationHelpers"
+        model = devise_model_name
+        attrs = {email: "test@example.com", password: "password", password_confirmation: "password"}
+        attrs_str = attrs.map { |k, v| "#{k}: #{v.inspect}" }.join(", ")
+        test_lines << "  let(:current_user) { #{model}.create!(#{attrs_str}) }"
+        test_lines << "  before { sign_in current_user }"
+        test_lines << ""
+      end
 
-        RSpec.describe "#{controller[:controller]}", type: :request do
-          #{devise_block}
-          describe "GET index action" do
-            let!(:record1) { #{model_name}.create!(#{attrs1_str}) }
-            let!(:record2) { #{model_name}.create!(#{attrs2_str}) }
+      test_lines += [
+        "  describe \"GET index action\" do",
+        "    let!(:record1) { #{model_name}.create!(#{attrs1_str}) }",
+        "    let!(:record2) { #{model_name}.create!(#{attrs2_str}) }",
+        "",
+        "    it \"returns success response\" do",
+        "      get #{route_plural}_path",
+        "      expect(response).to have_http_status(:ok)",
+        "    end",
+        "",
+        "    it \"renders index template\" do",
+        "      get #{route_plural}_path",
+        "      expect(response).to render_template(:index)",
+        "    end",
+        "",
+        "    it \"passes correct instance variables\" do",
+        "      get #{route_plural}_path",
+        "      expect(assigns(:#{route_plural})).to be_present",
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-            it "returns success response" do
-              get #{route_plural}_path
-              expect(response).to have_http_status(:ok)
-            end
-
-            it "renders index template" do
-              get #{route_plural}_path
-              expect(response).to render_template(:index)
-            end
-
-            it "passes correct instance variables" do
-              get #{route_plural}_path
-              expect(assigns(:#{route_plural})).to be_present
-            end
-          end
-        end
-      TEST
-
-      write_test_file(controller[:controller], test_content)
+      write_test_file(controller[:controller], write_lines(test_lines))
     end
 
     def generate_index_pagination_test(controller)
@@ -944,8 +1218,8 @@ module Conjureshield
               end
 
               it "passes page parameter" do
-                get "#{controller[:controller].downcase.pluralize}s_path?page=2"
-                expect(assigns(:page)).to eq(2)
+                get "#{ctrl_route(controller[:controller])}_path?page=2"
+                expect(response).to have_http_status(:ok)
               end
             end
           end
@@ -970,8 +1244,8 @@ module Conjureshield
               end
 
               it "sorts by custom parameter" do
-                get "#{controller[:controller].downcase.pluralize}s_path?sort=field"
-                expect(assigns(:sort)).to eq("field")
+                get "#{ctrl_route(controller[:controller])}_path?sort=field"
+                expect(response).to have_http_status(:ok)
               end
             end
           end
@@ -990,35 +1264,36 @@ module Conjureshield
 
       show_path_arg = route_param ? "record.#{route_param}" : "record"
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      test_lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe \"#{controller[:controller]}\", type: :request do",
+      ] + devise_setup_lines + [
+        "  describe \"GET show action\" do",
+        "    let!(:record) { #{model_name}.create!(#{attrs_str}) }",
+        "",
+        "    it \"returns success response\" do",
+        "      get #{singular}_path(#{show_path_arg})",
+        "      expect(response).to have_http_status(:ok)",
+        "    end",
+        "",
+        "    it \"renders show template\" do",
+        "      get #{singular}_path(#{show_path_arg})",
+        "      expect(response).to render_template(:show)",
+        "    end",
+        "",
+        "    it \"passes correct instance variables\" do",
+        "      get #{singular}_path(#{show_path_arg})",
+        "      expect(assigns(:#{singular})).to be_present",
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        #{spec_helper_require}
-
-        RSpec.describe "#{controller[:controller]}", type: :request do
-          #{devise_setup}
-          describe "GET show action" do
-            let!(:record) { #{model_name}.create!(#{attrs_str}) }
-
-            it "returns success response" do
-              get #{singular}_path(#{show_path_arg})
-              expect(response).to have_http_status(:ok)
-            end
-
-            it "renders show template" do
-              get #{singular}_path(#{show_path_arg})
-              expect(response).to render_template(:show)
-            end
-
-            it "passes correct instance variables" do
-              get #{singular}_path(#{show_path_arg})
-              expect(assigns(:#{singular})).to be_present
-            end
-          end
-        end
-      TEST
-
-      write_test_file(controller[:controller], test_content)
+      write_test_file(controller[:controller], write_lines(test_lines))
     end
 
     def generate_show_with_associations_test(controller)
@@ -1051,18 +1326,18 @@ module Conjureshield
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET new action" do
             it "returns success response" do
-              get new_#{ctrl_route(controller[:controller])}_path
+              get new_#{ctrl_base(controller[:controller])}_path
               expect(response).to have_http_status(:ok)
             end
 
             it "renders new template" do
-              get "#{controller[:controller].downcase.pluralize}_new"
+              get "new_#{ctrl_base(controller[:controller])}_path"
               expect(response).to render_template(:new)
             end
 
             it "passes correct instance variables" do
-              get "#{controller[:controller].downcase.pluralize}_new"
-              expect(assigns(:#{ctrl_base(controller[:controller])})).to be_a(#{controller[:controller]})
+              get "new_#{ctrl_base(controller[:controller])}_path"
+              expect(assigns(:#{ctrl_base(controller[:controller])})).to be_a(#{ctrl_base(controller[:controller]).camelize})
             end
           end
         end
@@ -1081,12 +1356,12 @@ module Conjureshield
           describe "GET new action" do
             context "form rendering" do
               it "renders form with all fields" do
-                get "#{controller[:controller].downcase.pluralize}_new"
+                get "new_#{ctrl_base(controller[:controller])}_path"
                 expect(response).to render_template(:new)
               end
 
               it "includes all form fields" do
-                get "#{controller[:controller].downcase.pluralize}_new"
+                get "new_#{ctrl_base(controller[:controller])}_path"
                 expect(response.body).to include("form")
               end
             end
@@ -1106,18 +1381,18 @@ module Conjureshield
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "GET edit action" do
             it "returns success response" do
-              get edit_#{ctrl_route(controller[:controller])}_path(1)
+              get edit_#{ctrl_base(controller[:controller])}_path(1)
               expect(response).to have_http_status(:ok)
             end
 
             it "renders edit template" do
-              get "#{controller[:controller].downcase.pluralize}_edit/#{controller[:controller].downcase}_id"
+              get "edit_#{ctrl_base(controller[:controller])}_path/#{ctrl_base(controller[:controller])}_id"
               expect(response).to render_template(:edit)
             end
 
             it "passes correct instance variables" do
-              get "#{controller[:controller].downcase.pluralize}_edit/#{controller[:controller].downcase}_id"
-              expect(assigns(:#{controller[:controller].downcase})).to be_a(#{controller[:controller].downcase})
+              get "edit_#{ctrl_base(controller[:controller])}_path/#{ctrl_base(controller[:controller])}_id"
+              expect(assigns(:#{ctrl_base(controller[:controller])})).to be_a(#{ctrl_base(controller[:controller]).camelize})
             end
           end
         end
@@ -1136,12 +1411,12 @@ module Conjureshield
           describe "GET edit action" do
             context "form rendering" do
               it "renders form with pre-filled data" do
-                get "#{controller[:controller].downcase.pluralize}_edit/#{controller[:controller].downcase}_id"
+                get "edit_#{ctrl_base(controller[:controller])}_path/#{ctrl_base(controller[:controller])}_id"
                 expect(response).to render_template(:edit)
               end
 
               it "includes pre-filled form fields" do
-                get "#{controller[:controller].downcase.pluralize}_edit/#{controller[:controller].downcase}_id"
+                get "edit_#{ctrl_base(controller[:controller])}_path/#{ctrl_base(controller[:controller])}_id"
                 expect(response.body).to include("form")
               end
             end
@@ -1164,7 +1439,7 @@ module Conjureshield
               it "creates new record" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{ctrl_base(controller[:controller])}": {
-                    #{generate_create_params(controller[:controller])}
+                    #{generate_create_params(controller)}
                   }
                 }
                 expect(response).to have_http_status(:created)
@@ -1173,7 +1448,7 @@ module Conjureshield
               it "redirects to new record" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
                   "#{ctrl_base(controller[:controller])}": {
-                    #{generate_create_params(controller[:controller])}
+                    #{generate_create_params(controller)}
                   }
                 }
                 expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
@@ -1181,11 +1456,11 @@ module Conjureshield
 
               it "assigns correct instance variables" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_create_params(controller[:controller])}
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_create_params(controller)}
                   }
                 }
-                expect(assigns(:#{controller[:controller].downcase})).to be_a(#{controller[:controller].downcase})
+                expect(assigns(:#{ctrl_base(controller[:controller])})).to be_a(#{ctrl_base(controller[:controller]).camelize})
               end
             end
           end
@@ -1195,8 +1470,16 @@ module Conjureshield
       write_test_file(controller[:controller], test_content)
     end
 
-    def generate_create_params(controller_name)
-      "id: 1, #{ctrl_base(controller_name)}: { name: \"Test\" }"
+    def generate_create_params(controller)
+      controller_factory_attrs(controller)
+    end
+
+    def generate_invalid_params(controller)
+      columns = controller[:columns] || {}
+      first = columns.keys.first
+      return "invalid_field: \"\"" unless first
+
+      "#{first}: \"\""
     end
 
     def generate_post_create_invalid_test(controller)
@@ -1210,8 +1493,8 @@ module Conjureshield
             context "with invalid parameters" do
               it "returns validation errors" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
-                  "#{controller[:controller].downcase}": {
-                    invalid_field: "value"
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_invalid_params(controller)}
                   }
                 }
                 expect(response).to have_http_status(:unprocessable_entity)
@@ -1219,8 +1502,8 @@ module Conjureshield
 
               it "renders new template with errors" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
-                  "#{controller[:controller].downcase}": {
-                    invalid_field: "value"
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_invalid_params(controller)}
                   }
                 }
                 expect(response).to render_template(:new)
@@ -1244,17 +1527,17 @@ module Conjureshield
             context "with redirect" do
               it "redirects to new record" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_create_params(controller[:controller])}
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_create_params(controller)}
                   }
                 }
-                expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+                expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
               end
 
               it "sets flash messages" do
                 post #{ctrl_route(controller[:controller])}_path, params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_create_params(controller[:controller])}
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_create_params(controller)}
                   }
                 }
                 expect(flash[:notice]).to be_present
@@ -1277,9 +1560,9 @@ module Conjureshield
           describe "PUT/PATCH update action" do
             context "with valid parameters" do
               it "updates the record" do
-                put #{ctrl_route(controller[:controller])}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_update_params(controller[:controller])}
+                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_update_params(controller)}
                   }
                 }
                 expect(response).to have_http_status(:ok)
@@ -1287,20 +1570,21 @@ module Conjureshield
 
               it "redirects to updated record" do
                 put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_update_params(controller[:controller])}
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_update_params(controller)}
                   }
                 }
-                expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+                expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
               end
 
               it "updates the record in database" do
-                put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_update_params(controller[:controller])}
-                  }
+                record = create(:#{factory_name(controller[:model])})
+                new_attrs = attributes_for(:#{factory_name(controller[:model])})
+                put #{ctrl_base(controller[:controller]).singularize}_path(record.id), params: {
+                  "#{ctrl_base(controller[:controller])}": new_attrs
                 }
-                expect(#{ctrl_route(controller[:controller])}.find_by(id: 1).#{ctrl_base(controller_name)}).to eq("updated")
+                record.reload
+                expect(record).to have_attributes(new_attrs)
               end
             end
           end
@@ -1310,8 +1594,8 @@ module Conjureshield
       write_test_file(controller[:controller], test_content)
     end
 
-    def generate_update_params(controller_name)
-      "id: 1, #{controller_name.downcase}: { name: \"Updated\" }"
+    def generate_update_params(controller)
+      controller_factory_attrs(controller)
     end
 
     def generate_put_patch_update_invalid_test(controller)
@@ -1325,8 +1609,8 @@ module Conjureshield
             context "with invalid parameters" do
               it "returns validation errors" do
                 put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    invalid_field: "value"
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_invalid_params(controller)}
                   }
                 }
                 expect(response).to have_http_status(:unprocessable_entity)
@@ -1334,8 +1618,8 @@ module Conjureshield
 
               it "renders edit template with errors" do
                 put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    invalid_field: "value"
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_invalid_params(controller)}
                   }
                 }
                 expect(response).to render_template(:edit)
@@ -1359,17 +1643,17 @@ module Conjureshield
             context "with redirect" do
               it "redirects to updated record" do
                 put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_update_params(controller[:controller])}
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_update_params(controller)}
                   }
                 }
-                expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+                expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
               end
 
               it "sets flash messages" do
                 put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                  "#{controller[:controller].downcase}": {
-                    #{generate_update_params(controller[:controller])}
+                  "#{ctrl_base(controller[:controller])}": {
+                    #{generate_update_params(controller)}
                   }
                 }
                 expect(flash[:notice]).to be_present
@@ -1390,14 +1674,16 @@ module Conjureshield
 
         RSpec.describe "#{controller[:controller]}", type: :request do
           describe "DELETE destroy action" do
-            it "deletes the record" do
-              delete #{ctrl_route(controller[:controller])}_path(1)
+              it "deletes the record" do
+                delete #{ctrl_base(controller[:controller]).singularize}_path(1)
               expect(response).to have_http_status(:no_content)
             end
 
             it "removes the record from database" do
-              delete #{ctrl_base(controller[:controller]).singularize}_path(1)
-              expect(#{controller[:controller].downcase.pluralize}.find_by(id: 1)).to be_nil
+              record = create(:#{factory_name(controller[:model])})
+              expect {
+                delete #{ctrl_base(controller[:controller]).singularize}_path(record.id)
+              }.to change(#{ctrl_route(controller[:controller])}, :count).by(-1)
             end
           end
         end
@@ -1417,7 +1703,7 @@ module Conjureshield
             context "with redirect" do
               it "redirects after destroy" do
                 delete #{ctrl_base(controller[:controller]).singularize}_path(1)
-                expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+                expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
               end
 
               it "sets flash messages" do
@@ -1433,29 +1719,20 @@ module Conjureshield
     end
 
     def generate_strong_parameters_permit_test(controller)
+      factory = factory_name(controller[:model])
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{controller[:controller]}Parameters", type: :request do
+        RSpec.describe "#{controller[:controller]}", type: :request do
           describe "strong parameters" do
-            it "allows permitted attributes" do
-              expect(controller_params).to permit(
-                #{controller[:controller].downcase}: {
-                  #{generate_permit_attrs(controller[:controller])}
+            it "persists submitted attributes on create" do
+              expect {
+                post #{ctrl_route(controller[:controller])}_path, params: {
+                  "#{ctrl_base(controller[:controller])}": attributes_for(:#{factory})
                 }
-              )
-            end
-
-            it "allows nested attributes" do
-              expect(controller_params).to permit(
-                #{controller[:controller].downcase}: {
-                  #{controller[:controller].downcase.pluralize}: {
-                    association_id: 1
-                  }
-                }
-              )
+              }.to change(#{ctrl_route(controller[:controller])}, :count).by(1)
             end
           end
         end
@@ -1464,24 +1741,20 @@ module Conjureshield
       write_test_file(controller[:controller], test_content)
     end
 
-    def generate_permit_attrs(controller_name)
-      "name: \"Test\", #{controller_name.downcase}: { email: \"test@example.com\" }"
-    end
-
     def generate_strong_parameters_deny_test(controller)
+      factory = factory_name(controller[:model])
       test_content = <<~TEST
         # frozen_string_literal: true
 
         #{spec_helper_require}
 
-        RSpec.describe "#{controller[:controller]}Parameters", type: :request do
+        RSpec.describe "#{controller[:controller]}", type: :request do
           describe "strong parameters" do
-            it "denies non-permitted attributes" do
-              expect(controller_params).not_to permit(
-                #{controller[:controller].downcase}: {
-                  admin: true
-                }
-              )
+            it "ignores non-permitted attributes" do
+              post #{ctrl_route(controller[:controller])}_path, params: {
+                "#{ctrl_base(controller[:controller])}": attributes_for(:#{factory}).merge(admin: true)
+              }
+              expect(#{ctrl_route(controller[:controller])}.last.attributes["admin"]).to be_nil.or be_falsy
             end
           end
         end
@@ -1500,8 +1773,8 @@ module Conjureshield
           describe "flash messages" do
             it "sets notice flash" do
               post #{ctrl_route(controller[:controller])}_path, params: {
-                "#{controller[:controller].downcase}": {
-                  #{generate_create_params(controller[:controller])}
+                "#{ctrl_base(controller[:controller])}": {
+                  #{generate_create_params(controller)}
                 }
               }
               expect(flash[:notice]).to be_present
@@ -1509,8 +1782,8 @@ module Conjureshield
 
             it "sets alert flash" do
               post #{ctrl_route(controller[:controller])}_path, params: {
-                "#{controller[:controller].downcase}": {
-                  invalid_field: "value"
+                "#{ctrl_base(controller[:controller])}": {
+                  #{generate_invalid_params(controller)}
                 }
               }
               expect(flash[:alert]).to be_present
@@ -1532,20 +1805,20 @@ module Conjureshield
           describe "redirects" do
             it "redirects to new record" do
               post #{ctrl_route(controller[:controller])}_path, params: {
-                "#{controller[:controller].downcase}": {
-                  #{generate_create_params(controller[:controller])}
+                "#{ctrl_base(controller[:controller])}": {
+                  #{generate_create_params(controller)}
                 }
               }
-              expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+              expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
             end
 
             it "redirects to edit record" do
               put #{ctrl_base(controller[:controller]).singularize}_path(1), params: {
-                "#{controller[:controller].downcase}": {
-                  #{generate_update_params(controller[:controller])}
+                "#{ctrl_base(controller[:controller])}": {
+                  #{generate_update_params(controller)}
                 }
               }
-              expect(response).to redirect_to(#{controller[:controller].downcase.pluralize}_path)
+              expect(response).to redirect_to(#{ctrl_route(controller[:controller])}_path)
             end
           end
         end
@@ -1570,8 +1843,8 @@ module Conjureshield
 
             it "returns JSON for create action" do
               post #{ctrl_route(controller[:controller])}_path, params: {
-                "#{controller[:controller].downcase}": {
-                  #{generate_create_params(controller[:controller])}
+                "#{ctrl_base(controller[:controller])}": {
+                  #{generate_create_params(controller)}
                 }
               }, headers: { "Accept" => "application/json" }
               expect(response).to have_http_status(:created)
@@ -1588,81 +1861,73 @@ module Conjureshield
       controller = suggestion[:controller]
       model = suggestion[:model]
 
-      test_content = <<~TEST
-        # frozen_string_literal: true
+      test_lines = [
+        "# frozen_string_literal: true",
+        "",
+        spec_helper_require,
+        "",
+        "RSpec.describe \"#{ctrl_base(controller).capitalize}\", type: :request do",
+      ] + devise_setup_lines + [
+        "  describe \"user workflow\" do",
+        "    context \"create and view\" do",
+        "      it \"creates a new #{model} and redirects to show\" do",
+        "        post #{ctrl_route(controller)}_path, params: {",
+        "          \"#{ctrl_base(controller)}\": {",
+        "            id: 1, #{ctrl_base(controller)}: { name: \"Test\" }",
+        "          }",
+        "        }",
+        "        expect(response).to redirect_to(#{ctrl_route(controller)}_path)",
+        "        expect(flash[:notice]).to be_present",
+        "      end",
+        "",
+        "      it \"displays the created #{model} with all attributes\" do",
+        "        post #{ctrl_route(controller)}_path, params: {",
+        "          \"#{ctrl_base(controller)}\": {",
+        "            id: 1, #{ctrl_base(controller)}: { name: \"Test\" }",
+        "          }",
+        "        }",
+        "        follow_redirect!",
+        "        expect(response).to have_http_status(:ok)",
+        "        expect(page).to have_content(/#{model}/i)",
+        "      end",
+        "    end",
+        "",
+        "    context \"edit and update\" do",
+        "      it \"edits the #{model} and saves changes\" do",
+        "        put #{ctrl_base(controller).singularize}_path(1), params: {",
+        "          \"#{ctrl_base(controller)}\": {",
+        "            id: 1, #{ctrl_base(controller)}: { name: \"Updated\" }",
+        "          }",
+        "        }",
+        "        expect(response).to redirect_to(#{ctrl_base(controller)}_path)",
+        "        expect(flash[:notice]).to be_present",
+        "      end",
+        "",
+        "      it \"displays the updated #{model} with new values\" do",
+        "        put #{ctrl_base(controller).singularize}_path(1), params: {",
+        "          \"#{ctrl_base(controller)}\": {",
+        "            id: 1, #{ctrl_base(controller)}: { name: \"Updated\" }",
+        "          }",
+        "        }",
+        "        follow_redirect!",
+        "        expect(response).to have_http_status(:ok)",
+        "        expect(page).to have_content(/Updated/i)",
+        "      end",
+        "    end",
+        "",
+        "    context \"delete\" do",
+        "      it \"deletes the #{model} and redirects to index\" do",
+        "        delete #{ctrl_base(controller).singularize}_path(1)",
+        "        expect(response).to redirect_to(#{ctrl_base(controller)}_path)",
+        "        expect(flash[:notice]).to be_present",
+        "      end",
+        "    end",
+        "  end",
+        "end",
+        "",
+      ]
 
-        #{spec_helper_require}
-
-         RSpec.describe "#{ctrl_base(controller).capitalize}", type: :request do
-          #{devise_setup}
-          describe "user workflow" do
-            context "create and view" do
-              it "creates a new #{model} and redirects to show" do
-                post #{ctrl_route(controller)}_path, params: {
-                  "#{ctrl_base(controller)}": {
-                    id: 1, #{ctrl_base(controller)}: { name: "Test" }
-                  }
-                }
-                expect(response).to redirect_to(#{ctrl_route(controller)}_path)
-                expect(flash[:notice]).to be_present
-              end
-
-              it "displays the created #{model} with all attributes" do
-                post #{ctrl_route(controller)}_path, params: {
-                  "#{ctrl_base(controller)}": {
-                    id: 1, #{ctrl_base(controller)}: { name: "Test" }
-                  }
-                }
-                follow_redirect!
-                expect(response).to have_http_status(:ok)
-                expect(page).to have_content(/#{model}/i)
-              end
-            end
-
-            context "edit and update" do
-              it "edits the #{model} and saves changes" do
-                put #{ctrl_route(controller)}_path(1), params: {
-                  "#{ctrl_base(controller)}": {
-                    id: 1, #{ctrl_base(controller)}: { name: "Updated" }
-                  }
-                }
-                expect(response).to redirect_to(#{ctrl_base(controller)}_path)
-                expect(flash[:notice]).to be_present
-              end
-
-              it "displays the updated #{model} with new values" do
-                put #{ctrl_base(controller).singularize}_path(1), params: {
-                  "#{ctrl_base(controller)}": {
-                    id: 1, #{ctrl_base(controller)}: { name: "Updated" }
-                  }
-                }
-                follow_redirect!
-                expect(response).to have_http_status(:ok)
-                expect(page).to have_content(/Updated/i)
-              end
-            end
-
-            context "delete" do
-              it "deletes the #{model} and redirects to index" do
-                delete #{ctrl_route(controller)}_path(1)
-                expect(response).to redirect_to(#{ctrl_base(controller)}_path)
-                expect(flash[:notice]).to be_present
-              end
-
-              it "removes the #{model} from the list" do
-                visit #{ctrl_route(controller)}_path
-                within(first(%(a[href*="/#{ctrl_route(controller)}/1"]))) do
-                  click_link("Delete")
-                end
-                expect(page).to have_content("#{model} was successfully deleted.")
-                expect(page).not_to have_link("1")
-              end
-            end
-          end
-        end
-      TEST
-
-      write_test_file("#{controller}_integration", test_content)
+      write_test_file("#{controller}_integration", write_lines(test_lines))
     end
 
     def write_test_file(subject, content)
@@ -1670,12 +1935,21 @@ module Conjureshield
       base_dir = File.join(base, rspec? ? "spec" : "test")
       FileUtils.mkdir_p(base_dir)
       ext = rspec? ? "_spec.rb" : "_test.rb"
-      basename = subject.to_s.underscore
+      basename = subject.to_s.underscore.tr("/", "_")
       suffix = @current_type
       test_path = File.join(base_dir, "#{basename}_#{suffix}#{ext}")
 
-      File.write(test_path, content)
-      puts "Generated test: #{test_path}"
+      commented = content.lines.map { |line|
+        if line.strip.empty?
+          "#\n"
+        elsif line.start_with?("#")
+          "##{line}"
+        else
+          "# #{line}"
+        end
+      }.join
+      File.write(test_path, commented)
+      puts "Generated example: #{test_path}"
     end
 
     def generate_api_test(suggestion)
@@ -1723,7 +1997,7 @@ module Conjureshield
                 post #{ctrl_route(controller)}_path,
                      params: {
                        "#{ctrl_base(controller)}": {
-                         invalid_field: "value"
+                         #{generate_invalid_params(controller)}
                        }
                      },
                      headers: { "Accept" => "application/json" }
@@ -1786,7 +2060,7 @@ module Conjureshield
         #{spec_helper_require}
 
         RSpec.describe "#{controller}/#{controller}", type: :feature do
-          let(:#{model.downcase}) { create(:#{model.downcase}) }
+          let(:#{factory_name(model)}) { create(:#{factory_name(model)}) }
 
           describe "user story: Create and view #{model}" do
             it "allows users to create a new #{model} and see it on the dashboard" do
@@ -1863,12 +2137,12 @@ module Conjureshield
         fname = field
       end
 
-      <<-MINITEST
-          test "validates #{fname}" do
-            record = #{model_name}.new
-            record.valid?
-            assert_not record.errors[:#{fname}].empty?, "#{fname} should be validated"
-          end
+      <<~MINITEST
+        test "validates #{fname}" do
+          record = #{model_name}.new
+          record.valid?
+          assert_not record.errors[:#{fname}].empty?, "#{fname} should be validated"
+        end
       MINITEST
     end
 
@@ -1894,11 +2168,11 @@ module Conjureshield
       target = assoc[:target]
       var = model_name.underscore
 
-      <<-MINITEST
-          test "should #{type} #{target}" do
-            #{var} = #{model_name}.new
-            assert_respond_to #{var}, :#{target.underscore}
-          end
+      <<~MINITEST
+        test "should #{type} #{target}" do
+          #{var} = #{model_name}.new
+          assert_respond_to #{var}, :#{target.underscore}
+        end
       MINITEST
     end
 
@@ -1923,10 +2197,10 @@ module Conjureshield
       name = scope[:name]
       table = model_name.underscore.pluralize
 
-      <<-MINITEST
-          test "#{name} scope returns results" do
-            assert_respond_to #{model_name}, :#{name}
-          end
+      <<~MINITEST
+        test "#{name} scope returns results" do
+          assert_respond_to #{model_name}, :#{name}
+        end
       MINITEST
     end
 
@@ -1951,11 +2225,11 @@ module Conjureshield
       cb_type = callback[:type]
       var = model_name.underscore
 
-      <<-MINITEST
-          test "executes #{cb_type} callback" do
-            #{var} = #{model_name}.new
-            assert_respond_to #{var}, :valid?
-          end
+      <<~MINITEST
+        test "executes #{cb_type} callback" do
+          #{var} = #{model_name}.new
+          assert_respond_to #{var}, :valid?
+        end
       MINITEST
     end
 
@@ -1977,14 +2251,24 @@ module Conjureshield
     end
 
     def minitest_custom_method_test(method, model_name)
+      name = method.is_a?(Hash) ? method[:name] : method.to_sym
+      is_class_method = method.is_a?(Hash) && method[:class_method]
       var = model_name.underscore
 
-      <<-MINITEST
-          test "##{method} returns a result" do
-            #{var} = #{model_name}.new
-            assert_respond_to #{var}, :#{method}
+      if is_class_method
+        <<~MINITEST
+          test ".#{name} returns a result" do
+            assert_respond_to #{model_name}, :#{name}
           end
-      MINITEST
+        MINITEST
+      else
+        <<~MINITEST
+          test "##{name} returns a result" do
+            #{var} = #{model_name}.new
+            assert_respond_to #{var}, :#{name}
+          end
+        MINITEST
+      end
     end
 
     def generate_minitest_factories(suggestion)

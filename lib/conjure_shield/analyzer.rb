@@ -1,14 +1,10 @@
-require "parser/current"
 require "prism"
 require "rubocop"
 require "rubocop-rails"
 require "rubocop-rspec"
-require "json"
-require "net/http"
-require "uri"
-require "nokogiri"
+require "open3"
 
-module Conjureshield
+module ConjureShield
   class Analyzer
     RESTFUL_ACTIONS = %i[index show new create edit update destroy].freeze
     SINGULAR_ACTIONS = %i[show new create edit update destroy].freeze
@@ -82,7 +78,6 @@ module Conjureshield
         extract_factories(file, content)
         extract_serialization(file, content)
         extract_delegation(file, ast)
-        extract_stimulus(file, content)
         extract_cable_subscriptions(file, content)
         extract_cable_broadcasts(file, content)
         extract_describe_blocks(file, content)
@@ -127,21 +122,24 @@ module Conjureshield
 
     def extract_model_info(file, ast)
       return unless file.include?("/app/models/")
-      
+
       content = @files.find { |f| f[:path] == file }&.dig(:content) || ""
-      model_name = File.basename(file, ".rb").split('_').map(&:capitalize).join
-      
-      if content.include?("devise ") || content.include?("devise ")
-        @devise_model ||= model_name
-      end
-      
+      model_name = model_name_from_path(file)
+
+      @devise_model ||= model_name if content.include?("devise")
+
       @ast_nodes << { file: file, model: model_name, type: :model }
+    end
+
+    def model_name_from_path(path)
+      relative = path.sub(%r{.*/app/[^/]+/}, "").sub(/\.rb\z/, "")
+      relative.split("/").map { |part| part.split("_").map(&:capitalize).join }.join("::")
     end
 
     def extract_controller_info(file, ast)
       return unless file.include?("/app/controllers/")
-      
-      controller_name = File.basename(file, ".rb").split('_').map(&:capitalize).join
+
+      controller_name = model_name_from_path(file)
       @ast_nodes << { file: file, controller: controller_name, type: :controller }
     end
 
@@ -249,12 +247,13 @@ module Conjureshield
 
         def visit_call_node(node)
           if @targets.include?(node.name)
-            target = nil
+            name = nil
             if node.arguments&.arguments&.first
               arg = node.arguments.arguments.first
-              target = arg.value if arg.respond_to?(:value)
+              name = arg.value.to_s if arg.respond_to?(:value)
             end
-            @associations << { type: node.name, target: target&.to_s&.classify }
+            target = name.classify
+            @associations << { type: node.name, name: name, target: target }
           end
           super
         end
@@ -324,13 +323,30 @@ module Conjureshield
     end
 
     def extract_stimulus(file, content)
-      return unless file.include?("application.js") || file.include?("stimulus") ||
-                    file.end_with?("_controller.js")
+      return unless file.end_with?("_controller.js")
 
       controller_name = file.match(/(\w+)_controller\.js\z/)&.[](1)
-      identifier = controller_name || File.basename(file, File.extname(file))
+      return unless controller_name
 
-      @ast_nodes << { file: file, controller: identifier, type: :stimulus }
+      info = { file: file, controller: controller_name, type: :stimulus }
+
+      if content =~ /static\s+targets\s*=\s*\[([^\]]*)\]/
+        info[:targets] = $1.split(",").map { |t| t.strip.gsub(/["'\s]/, "") }.reject(&:empty?)
+      end
+
+      if content =~ /static\s+values\s*=\s*\{(.*?)\}/m
+        info[:values] = {}
+        $1.scan(/(\w+)\s*:\s*(\w+)/) { info[:values][$1] = $2 }
+      end
+
+      if content =~ /static\s+classes\s*=\s*\[([^\]]*)\]/
+        info[:classes] = $1.split(",").map { |t| t.strip.gsub(/["'\s]/, "") }.reject(&:empty?)
+      end
+
+      lifecycle = %w[connect disconnect initialize export default class extends static get set constructor]
+      info[:actions] = content.scan(/^\s+(\w+)\s*\(/).flatten - lifecycle
+
+      @ast_nodes << info
     end
 
     def extract_cable_subscriptions(file, content)
@@ -382,67 +398,96 @@ module Conjureshield
     def parse_routes
       routes_file = File.join(@codebase_path, "config", "routes.rb")
       return unless File.exist?(routes_file)
+      return if @routes_parsed
 
-      @routes_parsed = true
+      if parse_routes_via_rails_command
+        @routes_parsed = true
+        return
+      end
 
       content = File.read(routes_file)
+      parse_routes_via_regex(content)
+      @routes_parsed = true
+    end
+
+    def parse_routes_via_rails_command
+      stdout, _, status = Open3.capture3(
+        "bundle", "exec", "rails", "routes",
+        chdir: @codebase_path
+      )
+      return false unless status.success?
+
+      stdout.each_line do |line|
+        stripped = line.strip
+        next if stripped.empty?
+        next if stripped.include?("Controller#Action")
+
+        if stripped =~ /([a-z_][a-z0-9_\/]*)#([a-z_]+)\s*\z/
+          controller_path = $1
+          action = $2.to_sym
+          controller_parts = controller_path.split("/").map(&:camelize)
+          controller_class = controller_parts.join("::") + "Controller"
+          register_controller_routes(controller_class, [action])
+        end
+      end
+
+      true
+    rescue => e
+      warn "rails routes command failed: #{e.message}"
+      false
+    end
+
+    def parse_routes_via_regex(content)
       prefix_stack = []
-      block_stack = []
 
       content.each_line do |line|
         stripped = line.strip
         next if stripped.empty? || stripped.start_with?("#")
 
         if stripped =~ /\Aend\b/
-          popped = block_stack.pop
-          prefix_stack.pop if [:namespace, :scope_module].include?(popped)
+          prefix_stack.pop
           next
         end
 
-        if stripped =~ /\bnamespace\s+(?::|["'])(\w+)\s+do\b/
-          block_stack << :namespace
+        if stripped =~ /\bnamespace\s+(?::|["'])(\w+)["']?\s+do\b/
           prefix_stack << $1.camelize
           next
         end
 
         if stripped =~ /\bscope\s+module:\s*(?::|["'])(\w+)["']?\s+do\b/
-          block_stack << :scope_module
           prefix_stack << $1.camelize
           next
         end
 
-        if stripped =~ /\b(resources|resource|member|collection|concern)\s+.*\bdo\b/
-          block_stack << :other
-        end
-
         prefix = prefix_stack.any? ? prefix_stack.join("::") + "::" : ""
 
-        if stripped =~ /\bresources\s+(?::|["'])(\w+)\b/
+        if stripped =~ /\bresources\s+(?::|["'])(\w+)["']?/
           resource_name = $1
           controller = "#{prefix}#{resource_name.camelize}Controller"
-          rest = $'
-          actions = parse_route_options(rest, RESTFUL_ACTIONS)
-          param = rest.match(/param:\s*(?::|["'])(\w+)["']?\s*/) && $1
+          actions = parse_route_options(stripped, RESTFUL_ACTIONS)
+          param = stripped.match(/param:\s*(?::|["'])(\w+)["']?\s*/) && $1
           register_controller_routes(controller, actions, param: param)
           next
         end
 
-        if stripped =~ /\bresource\s+(?::|["'])(\w+)/
+        if stripped =~ /\bresource\s+(?::|["'])(\w+)["']?/
           resource_name = $1
           controller = "#{prefix}#{resource_name.camelize}Controller"
-          actions = parse_route_options($', SINGULAR_ACTIONS)
+          actions = parse_route_options(stripped, SINGULAR_ACTIONS)
           register_controller_routes(controller, actions)
           next
         end
 
-        if stripped =~ /\b(get|post|put|patch|delete|match)\s+["'].*?["'].*\bto:\s*["'](\w+)#(\w+)["']/
-          controller = "#{prefix}#{$2.camelize}Controller"
+        if stripped =~ /\b(get|post|put|patch|delete|match)\s+["'].*?["'].*\bto:\s*["']([a-z_\/]+)#(\w+)["']/
+          controller_parts = $2.split("/").map(&:camelize)
+          controller = "#{prefix}#{controller_parts.join("::")}Controller"
           register_controller_routes(controller, [$3.to_sym])
           next
         end
 
-        if stripped =~ /\b(get|post|put|patch|delete|match)\s+["'].*?["']\s*=>\s*["'](\w+)#(\w+)["']/
-          controller = "#{prefix}#{$2.camelize}Controller"
+        if stripped =~ /\b(get|post|put|patch|delete|match)\s+["'].*?["']\s*=>\s*["']([a-z_\/]+)#(\w+)["']/
+          controller_parts = $2.split("/").map(&:camelize)
+          controller = "#{prefix}#{controller_parts.join("::")}Controller"
           register_controller_routes(controller, [$3.to_sym])
           next
         end
@@ -466,7 +511,11 @@ module Conjureshield
     end
 
     def routable_actions_for(controller_name)
-      @routes.fetch(controller_name, {}).fetch(:actions, [])
+      if @routes.key?(controller_name)
+        @routes[controller_name][:actions]
+      else
+        RESTFUL_ACTIONS
+      end
     end
 
     def route_param_for(controller_name)
@@ -499,7 +548,7 @@ module Conjureshield
     end
 
     def table_name_for_model(model_name)
-      model_name.underscore.pluralize
+      model_name.underscore.tr("/", "_").pluralize
     end
 
     def detect_missing_tests
@@ -586,7 +635,8 @@ module Conjureshield
             name: "Test factory",
             type: :factories,
             model: model_name,
-            columns: model_columns
+            columns: model_columns,
+            associations: model_node.dig(:metadata, :associations)
           }
 
           @missing_tests << {
@@ -612,37 +662,36 @@ module Conjureshield
           inferred_model = controller_name.sub(/Controller$/, "").singularize
           inferred_table = table_name_for_model(inferred_model)
           inferred_columns = schema_tables.fetch(inferred_table, {})
-
-          suggestions = []
-
           route_param = route_param_for(controller_name)
 
-          if !@routes_parsed || routable.include?(:index)
-            suggestions << {
-              name: "Test standard GET #index response parameters",
-              type: :get_index,
-              controller: controller_name,
-              model: inferred_model,
-              columns: inferred_columns,
-              route_param: route_param
-            }
+          suggestions = []
+          routable.each do |action|
+            next unless ACTION_ROUTE_MAP.key?(action)
+
+            ACTION_ROUTE_MAP[action].each do |type|
+              suggestions << {
+                name: "Test #{type} for #{controller_name}",
+                type: type,
+                controller: controller_name,
+                model: inferred_model,
+                columns: inferred_columns,
+                route_param: route_param
+              }
+            end
           end
 
           if !@routes_parsed || routable.include?(:create)
             suggestions << {
-              name: "Test POST #create branch handling",
-              type: :post_create,
+              name: "Test strong parameters permit for #{controller_name}",
+              type: :strong_parameters_permit,
               controller: controller_name,
               model: inferred_model,
               columns: inferred_columns,
               route_param: route_param
             }
-          end
-
-          if !@routes_parsed || routable.include?(:show)
             suggestions << {
-              name: "Test GET #show",
-              type: :get_show,
+              name: "Test strong parameters deny for #{controller_name}",
+              type: :strong_parameters_deny,
               controller: controller_name,
               model: inferred_model,
               columns: inferred_columns,
@@ -675,7 +724,11 @@ module Conjureshield
           suggestions: [{
             name: "Test #{controller_identifier} Stimulus controller",
             type: :stimulus,
-            controller: controller_identifier
+            controller: controller_identifier,
+            targets: node[:targets] || [],
+            values: node[:values] || {},
+            classes: node[:classes] || [],
+            actions: node[:actions] || []
           }]
         }
       end

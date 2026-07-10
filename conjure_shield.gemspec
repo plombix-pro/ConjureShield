@@ -14,18 +14,11 @@ Gem::Specification.new do |spec|
   spec.metadata["source_code_uri"] = "https://github.com/plombix-pro/ConjureShield"
   spec.metadata["bug_tracker_uri"] = "https://github.com/plombix-pro/ConjureShield/issues"
   spec.metadata["rubygems_mfa_required"] = "true"
-  spec.metadata["homepage_uri"] = spec.homepage
-  spec.metadata["source_code_uri"] = "https://github.com/plombix-pro/ConjureShield"
-  spec.metadata["bug_tracker_uri"] = "https://github.com/plombix-pro/ConjureShield/issues"
-
-  spec.files = Dir["lib/**/*", "bin/install-conjure.rb"]
-
+  spec.files = Dir["lib/**/*"]
   spec.require_paths = ["lib"]
-
   spec.add_dependency "rails", ">= 7.0.0"
   spec.add_dependency "prism", ">= 0.29.0"
   spec.add_dependency "rubocop", ">= 1.50.0"
   spec.add_dependency "rubocop-rails", ">= 2.20.0"
   spec.add_dependency "rubocop-rspec", ">= 2.24.0"
-  spec.add_dependency "rspec", ">= 3.12.0"
 end
